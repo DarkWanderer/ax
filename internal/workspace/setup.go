@@ -33,6 +33,10 @@ const (
 	DefaultAXDir = "/ax"
 	// InitializedMarkerFilename is the base name of the marker file written after a successful maiden run.
 	InitializedMarkerFilename = "initialized"
+	// goalMarkerSuffix is appended to a workspace's marker name for the file
+	// recording that its goal was carried out. The goal is tracked separately
+	// because it runs after the workspace is otherwise prepared.
+	goalMarkerSuffix = ".goal"
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -52,7 +56,7 @@ const (
 	// conversation logs and caches stay out of the workspace.
 	bootstrapDataDir = "antigravity"
 	// defaultBootstrapTimeout allows the agent enough time to install toolchains and
-	// dependencies. The workspace reports not-ready until it finishes.
+	// dependencies. The goal runs after the sandbox reports ready.
 	defaultBootstrapTimeout = 10 * time.Minute
 
 	dirPerm  = 0o755
@@ -73,14 +77,27 @@ type SetupResult struct {
 	BootstrapRan bool
 }
 
-// SetupWorkspace prepares the workspace directory on its maiden run: it clones the
-// declared Git repositories, creates the skills path, and invokes the Antigravity
-// bootstrap when a goal is provided. A marker file under AXDir records a completed
-// maiden run so subsequent calls are no-ops.
+// SetupWorkspace prepares a workspace and then carries out its goal, in that order.
+// Callers that serve a readiness endpoint should use PrepareWorkspace and RunGoal
+// directly instead: an agent working towards a goal needs the network, and a sandbox
+// gets none until it reports ready.
+func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string, goal string) (*SetupResult, error) {
+	res, err := PrepareWorkspace(ctx, ws, targetPath)
+	if err != nil {
+		return res, err
+	}
+	res.BootstrapRan = RunGoal(ctx, targetPath, goal)
+	return res, nil
+}
+
+// PrepareWorkspace prepares the workspace directory on its maiden run: it clones the
+// declared Git repositories and creates the skills path. A marker file under AXDir
+// records a completed maiden run so subsequent calls are no-ops. The workspace's goal
+// is not part of this; see RunGoal.
 //
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
-func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string, goal string) (*SetupResult, error) {
+func PrepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string) (*SetupResult, error) {
 	if targetPath == "" {
 		targetPath = defaultWorkspacePath
 	}
@@ -113,10 +130,6 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		res.SkillsMounted = setupSkills(ws.Spec.Skills)
 	}
 
-	if goal != "" {
-		res.BootstrapRan = runBootstrap(ctx, goal, targetPath)
-	}
-
 	if !gitOK {
 		slog.Warn("maiden run workspace setup completed with errors; marker omitted to allow retry", "path", targetPath)
 		return res, nil
@@ -125,6 +138,44 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	writeMarker(markerPath, ws)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
+}
+
+// RunGoal hands a workspace's goal to the agent, once. It reports whether the agent
+// ran to completion, recording that in its own marker file under AXDir so a later boot
+// does not repeat work the agent already did. A goal that could have run and did not --
+// an unreachable model, a failed agent -- leaves no marker and is attempted again on
+// the next boot.
+//
+// This must run after the sandbox reports ready. Substrate's egress proxy only carries
+// traffic for an actor its control plane considers running, so an agent started during
+// workspace preparation cannot reach its model at all.
+func RunGoal(ctx context.Context, targetPath, goal string) bool {
+	if goal == "" {
+		return false
+	}
+	if targetPath == "" {
+		targetPath = defaultWorkspacePath
+	}
+	if abs, err := filepath.Abs(targetPath); err == nil {
+		targetPath = abs
+	}
+
+	markerPath := filepath.Join(AXDir, MarkerName(targetPath)+goalMarkerSuffix)
+	if _, err := os.Stat(markerPath); err == nil {
+		slog.Info("workspace goal already carried out; skipping", "path", targetPath)
+		return false
+	}
+
+	ran, _ := runBootstrap(ctx, goal, targetPath)
+	if !ran {
+		return false
+	}
+
+	if err := os.WriteFile(markerPath, []byte(fmt.Sprintf("goal: %s\ncompleted_at: %s\n",
+		goal, time.Now().UTC().Format(time.RFC3339))), filePerm); err != nil {
+		slog.Warn("failed to write goal marker file", "path", markerPath, "error", err)
+	}
+	return true
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
@@ -270,18 +321,17 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 }
 
 // runBootstrap hands the goal to the Antigravity agent so it can prepare the workspace.
-// It reports whether the agent ran to completion. The agent needs the bootstrap script
-// installed and an API key in the environment; when either is missing the step is
-// skipped with a log line. Failures are logged and otherwise ignored so the task's own
-// command still starts.
-func runBootstrap(ctx context.Context, goal, targetPath string) bool {
+// It reports whether the agent completed the goal, and whether a later boot should
+// retry. The agent needs the bootstrap script and a Gemini API key. Missing
+// prerequisites skip the goal; an agent failure leaves it for the next boot.
+func runBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry bool) {
 	if _, err := os.Stat(bootstrapScriptPath); err != nil {
 		slog.Info("Antigravity bootstrap script not installed; skipping", "script", bootstrapScriptPath)
-		return false
+		return false, false
 	}
 	if os.Getenv(bootstrapAPIKeyEnv) == "" {
 		slog.Warn("workspace goal set but no API key available; skipping Antigravity bootstrap", "env", bootstrapAPIKeyEnv)
-		return false
+		return false, false
 	}
 
 	timeout := bootstrapTimeout()
@@ -308,10 +358,10 @@ func runBootstrap(ctx context.Context, goal, targetPath string) bool {
 		} else {
 			slog.Warn("Antigravity bootstrap failed (continuing)", "error", err)
 		}
-		return false
+		return false, true
 	}
 	slog.Info("Antigravity bootstrap completed successfully")
-	return true
+	return true, false
 }
 
 // bootstrapTimeout returns the configured bootstrap timeout, falling back to the default

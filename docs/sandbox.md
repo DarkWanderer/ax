@@ -4,7 +4,7 @@ Every task container starts with `ax-task-runner` as PID 1. On boot it:
 
 1. Loads the `Task` and every bound `Workspace` spec.
 2. Starts a metadata and guest-management daemon on port 80.
-3. On the first run, prepares each workspace at its own path, in binding order: clones Git repos, sets up the skills path, and, if the binding has a goal, hands that goal to an Antigravity agent to finish environment setup. The agent needs `GEMINI_API_KEY` in the container and gets 10 minutes by default; set `AX_BOOTSTRAP_TIMEOUT` to a Go duration to change that. The task reports not-ready until every workspace, including any agent run, has finished.
+3. On the first run, prepares each workspace at its own path, in binding order: clones Git repos and sets up the skills path. After the sandbox reports ready, a binding with a goal starts the Antigravity agent in the background. The agent needs `GEMINI_API_KEY` in the container and gets 10 minutes by default; set `AX_BOOTSTRAP_TIMEOUT` to a Go duration to change that. The task reports workspace readiness after preparation, while the goal and task command can continue running.
 4. Starts `spec.command` as a child process, with the first workspace as its working directory and `AX_METADATA_URL` plus `spec.env` in its environment, and supervises it.
 
 The runner stays up as PID 1 whether or not the command is still running, so the metadata server keeps answering and `ax ssh` still works after the command has exited. Its exit code is logged. When the sandbox is stopped or suspended, the runner sends the command's process group `SIGTERM`, waits ten seconds, and then kills whatever is left.
@@ -16,7 +16,8 @@ The daemon speaks HTTP/1.1 and `h2c` on the same port. Your agent can introspect
 | Endpoint | Method | Returns | Description |
 |---|---|---|---|
 | `/healthz` | `GET` | `text/plain` | Liveness. Always `200 OK`. |
-| `/readyz` | `GET` | `text/plain` | Readiness. `503` while the workspace is initializing, `200` once clones, MCP config, and skills are in place. |
+| `/readyz` | `GET` | `text/plain` | Guest readiness for Substrate. Returns `200` once the metadata server is serving, which enables sandbox egress. |
+| `/readyz?check=workspace` | `GET` | `text/plain` | Workspace readiness for AX. Returns `503` until preparation completes, then `200`. |
 | `/metadata/v1alpha1/ax/task` | `GET` | `application/yaml` | Full spec and status of the current `Task`. |
 | `/metadata/v1alpha1/ax/workspaces` | `GET` | `application/yaml` | Every bound `Workspace`, as a multi-document stream in binding order. |
 
