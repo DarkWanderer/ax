@@ -52,7 +52,7 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 ## The default runner
 
-`ax-task-runner` lives in `cmd/ax-task-runner` and is a thin wrapper over the `runner` Go package. It implements everything above and is documented from the inside in [Sandbox](sandbox.md). Its image, built from `Dockerfile.task-runner`, is Python 3.12 with `git`, `curl`, `openssh-client`, Antigravity, and Claude Code installed. A Task can select Claude Code for its workspace goal with `AX_GOAL_AGENT=claude`; the runner invokes it as an unprivileged user after workspace readiness.
+`ax-task-runner` lives in `cmd/ax-task-runner` and is a thin wrapper over the `runner` Go package. It implements everything above and is documented from the inside in [Sandbox](sandbox.md). Its image, built from `Dockerfile.task-runner`, is Python 3.12 with `git`, `curl`, `openssh-client`, Antigravity, and Claude Code installed. A Task can select Claude Code for its workspace goal with `AX_GOAL_AGENT=claude`; the runner invokes it in `dontAsk` mode with file and shell tools allowed after workspace readiness.
 
 ```bash
 make build-task-runner     # cross-compile for linux/amd64 and build the image

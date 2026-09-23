@@ -30,7 +30,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir google-antigravity
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
-RUN useradd --create-home --uid 1000 claude
 
 COPY bin/linux_amd64/ax-task-runner /usr/local/bin/ax-task-runner
 COPY cmd/ax-task-runner/antigravity_bootstrap.py /usr/local/bin/antigravity_bootstrap.py
