@@ -182,14 +182,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
+// handleReadyz answers two different questions on one path.
+//
+// Plain /readyz is Agent Substrate's container probe: it asks whether the guest
+// is up, and the answer gates everything the sandbox needs from the platform --
+// most importantly egress, since the egress proxy only carries traffic for an
+// actor the control plane considers running. Preparing a workspace clones Git
+// repositories over that very path, so holding this answer back until the
+// workspace is ready would deadlock: no clone without egress, no egress without
+// the answer.
+//
+// /readyz?check=workspace is the AX controller's question, and the one that
+// backs the task's WorkspaceReady condition: it asks whether the workspace has
+// actually been prepared.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	ready := s.workspaceReady
-	s.mu.RUnlock()
+	if r.URL.Query().Get("check") == "workspace" {
+		s.mu.RLock()
+		ready := s.workspaceReady
+		s.mu.RUnlock()
 
-	if !ready {
-		http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
-		return
+		if !ready {
+			http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)

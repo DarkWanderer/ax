@@ -82,8 +82,19 @@ func TestMetadataServer(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
 	}
 
-	// Test /readyz before workspace ready
+	// Plain /readyz is Substrate's probe: the guest is up, whatever the
+	// workspace is doing. Preparing the workspace needs the egress this answer
+	// unlocks, so it must not wait on the workspace.
 	resp, err = http.Get("http://127.0.0.1:9999/readyz")
+	if err != nil {
+		t.Fatalf("readyz request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from the guest probe before setup, got %d", resp.StatusCode)
+	}
+
+	// Test /readyz?check=workspace before workspace ready
+	resp, err = http.Get("http://127.0.0.1:9999/readyz?check=workspace")
 	if err != nil {
 		t.Fatalf("readyz request failed: %v", err)
 	}
@@ -94,8 +105,8 @@ func TestMetadataServer(t *testing.T) {
 	// Mark workspace ready
 	srv.SetWorkspaceReady(true)
 
-	// Test /readyz after workspace ready
-	resp, err = http.Get("http://127.0.0.1:9999/readyz")
+	// Test /readyz?check=workspace after workspace ready
+	resp, err = http.Get("http://127.0.0.1:9999/readyz?check=workspace")
 	if err != nil {
 		t.Fatalf("readyz request failed: %v", err)
 	}
