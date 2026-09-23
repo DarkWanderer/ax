@@ -21,11 +21,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -385,32 +382,11 @@ func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool,
 	timeout := bootstrapTimeout()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	account, err := user.Lookup("claude")
-	if err != nil {
-		slog.Warn("Claude runtime user not installed", "error", err)
-		return false, false
-	}
-	uid, uidErr := strconv.Atoi(account.Uid)
-	gid, gidErr := strconv.Atoi(account.Gid)
-	if uidErr != nil || gidErr != nil {
-		slog.Warn("invalid Claude runtime user ID")
-		return false, false
-	}
-	// Claude Code refuses unattended permission bypass as root. The workspace is
-	// isolated by Substrate; give its unprivileged child ownership of the clone.
-	if err := filepath.Walk(targetPath, func(path string, _ os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		return os.Lchown(path, uid, gid)
-	}); err != nil {
-		slog.Warn("making workspace writable for Claude", "error", err)
-		return false, true
-	}
-	cmd := exec.CommandContext(ctx, "claude", "--print", "--dangerously-skip-permissions", goal)
+	// gVisor disallows setuid in this sandbox. Allow only the tools this coding
+	// goal needs and decline any other permission request without prompting.
+	cmd := exec.CommandContext(ctx, "claude", "--print", "--permission-mode", "dontAsk",
+		"--permission-prompts", "none", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep", goal)
 	cmd.Dir = targetPath
-	cmd.Env = append(os.Environ(), "HOME="+account.HomeDir, "USER=claude", "LOGNAME=claude")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
