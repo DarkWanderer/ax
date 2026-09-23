@@ -17,7 +17,8 @@ The controller does not run `spec.command` as the container entrypoint. It alway
 | `AX_TASK_YAML` | The full `Task` resource as YAML, including status |
 | `AX_WORKSPACES_YAML` | Every bound `Workspace` resource as a multi-document YAML stream, in the task's binding order |
 | `spec.env` entries | Each one set directly in the container environment |
-| `GEMINI_API_KEY` | Set when the atespace has a Gemini credential configured |
+| `GEMINI_API_KEY` | Set for the default Antigravity goal agent when the atespace has a Gemini credential configured |
+| `ANTHROPIC_API_KEY` | Set for `AX_GOAL_AGENT=claude` when the atespace has `anthropic-api-secret` |
 | Volume | A durable directory mounted at `/workspace` |
 | Readiness probe | `GET /readyz` on port 80 |
 
@@ -51,7 +52,7 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 
 ## The default runner
 
-`ax-task-runner` lives in `cmd/ax-task-runner` and is a thin wrapper over the `runner` Go package. It implements everything above and is documented from the inside in [Sandbox](sandbox.md). Its image, built from `Dockerfile.task-runner`, is Python 3.12 with `git`, `curl`, `openssh-client`, and the Antigravity agent installed, because the goal-based workspace bootstrap hands the goal to Antigravity.
+`ax-task-runner` lives in `cmd/ax-task-runner` and is a thin wrapper over the `runner` Go package. It implements everything above and is documented from the inside in [Sandbox](sandbox.md). Its image, built from `Dockerfile.task-runner`, is Python 3.12 with `git`, `curl`, `openssh-client`, Antigravity, and Claude Code installed. A Task can select Claude Code for its workspace goal with `AX_GOAL_AGENT=claude`; the runner invokes it as an unprivileged user after workspace readiness.
 
 ```bash
 make build-task-runner     # cross-compile for linux/amd64 and build the image

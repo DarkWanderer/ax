@@ -40,6 +40,7 @@ type mockControlServer struct {
 	deletedActors    []string
 	actorTemplates   map[string]bool
 	deletedTemplates []string
+	createdTemplates []*ateapipb.ActorTemplate
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -127,6 +128,11 @@ func (m *mockControlServer) ListActorTemplates(ctx context.Context, req *ateapip
 		})
 	}
 	return resp, nil
+}
+
+func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.createdTemplates = append(m.createdTemplates, req.ActorTemplate)
+	return req.ActorTemplate, nil
 }
 
 func (m *mockControlServer) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
@@ -452,5 +458,56 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 		if !mockSrv.actorTemplates[keep] {
 			t.Errorf("template %s should not have been deleted", keep)
 		}
+	}
+}
+
+func TestTaskReconcilerClaudeCredential(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "gemini-must-not-be-injected")
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	reconciler.SecretResolver = func(_ context.Context, atespace, name, key string) (string, error) {
+		if atespace != "default" || name != "anthropic-api-secret" || key != "ANTHROPIC_API_KEY" {
+			t.Errorf("unexpected credential lookup: %s/%s key %s", atespace, name, key)
+			return "", nil
+		}
+		return "test-anthropic-key", nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "claude-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env:   []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+	env := map[string]string{}
+	for _, v := range mockSrv.createdTemplates[0].Containers[0].Env {
+		env[v.Name] = v.Value
+	}
+	if env["ANTHROPIC_API_KEY"] != "test-anthropic-key" {
+		t.Error("Anthropic key missing from Claude actor template")
+	}
+	if _, ok := env["GEMINI_API_KEY"]; ok {
+		t.Error("Gemini key was included in Claude actor template")
 	}
 }

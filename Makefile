@@ -42,7 +42,7 @@ install:
 	@echo "==> Installing ax CLI to $$(go env GOPATH)/bin..."
 	go install -trimpath -ldflags="-s -w" ./cmd/ax
 
-# Cross-compile ax-task-runner for Linux amd64 and build container image with Python, Antigravity, and git/curl
+# Cross-compile ax-task-runner for Linux amd64 and build the agent container image
 build-task-runner:
 	@echo "==> Cross-compiling ax-task-runner for linux/amd64..."
 	@mkdir -p bin/linux_amd64

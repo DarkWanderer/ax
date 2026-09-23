@@ -284,3 +284,20 @@ func TestMarkerName(t *testing.T) {
 		}
 	}
 }
+
+func TestRunGoalClaudeWithoutAnthropicKeyDoesNotUseGemini(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("GEMINI_API_KEY", "gemini-test-key")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+	if workspace.RunGoal(context.Background(), path, "write code") {
+		t.Fatal("goal ran without Anthropic credentials")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); !os.IsNotExist(err) {
+		t.Fatalf("goal marker exists without completion: %v", err)
+	}
+}

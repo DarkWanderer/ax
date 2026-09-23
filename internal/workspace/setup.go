@@ -21,8 +21,11 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -50,6 +53,8 @@ const (
 	bootstrapScriptPath = "/usr/local/bin/antigravity_bootstrap.py"
 	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run.
 	bootstrapAPIKeyEnv = "GEMINI_API_KEY"
+	goalAgentEnv       = "AX_GOAL_AGENT"
+	claudeAPIKeyEnv    = "ANTHROPIC_API_KEY"
 	// bootstrapTimeoutEnv overrides the default bootstrap timeout with a Go duration string.
 	bootstrapTimeoutEnv = "AX_BOOTSTRAP_TIMEOUT"
 	// bootstrapDataDir, under AXDir, is where the agent keeps its own state so
@@ -322,9 +327,12 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 
 // runBootstrap hands the goal to the Antigravity agent so it can prepare the workspace.
 // It reports whether the agent completed the goal, and whether a later boot should
-// retry. The agent needs the bootstrap script and a Gemini API key. Missing
+// retry. The default agent needs the bootstrap script and a Gemini API key. Missing
 // prerequisites skip the goal; an agent failure leaves it for the next boot.
 func runBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry bool) {
+	if os.Getenv(goalAgentEnv) == "claude" {
+		return runClaudeBootstrap(ctx, goal, targetPath)
+	}
 	if _, err := os.Stat(bootstrapScriptPath); err != nil {
 		slog.Info("Antigravity bootstrap script not installed; skipping", "script", bootstrapScriptPath)
 		return false, false
@@ -361,6 +369,59 @@ func runBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry
 		return false, true
 	}
 	slog.Info("Antigravity bootstrap completed successfully")
+	return true, false
+}
+
+// runClaudeBootstrap uses Claude Code inside the task sandbox after egress is ready.
+func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry bool) {
+	if os.Getenv(claudeAPIKeyEnv) == "" {
+		slog.Warn("workspace goal set but no Claude API key available", "env", claudeAPIKeyEnv)
+		return false, false
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		slog.Warn("Claude Code executable not installed", "error", err)
+		return false, false
+	}
+	timeout := bootstrapTimeout()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	account, err := user.Lookup("claude")
+	if err != nil {
+		slog.Warn("Claude runtime user not installed", "error", err)
+		return false, false
+	}
+	uid, uidErr := strconv.Atoi(account.Uid)
+	gid, gidErr := strconv.Atoi(account.Gid)
+	if uidErr != nil || gidErr != nil {
+		slog.Warn("invalid Claude runtime user ID")
+		return false, false
+	}
+	// Claude Code refuses unattended permission bypass as root. The workspace is
+	// isolated by Substrate; give its unprivileged child ownership of the clone.
+	if err := filepath.Walk(targetPath, func(path string, _ os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		return os.Lchown(path, uid, gid)
+	}); err != nil {
+		slog.Warn("making workspace writable for Claude", "error", err)
+		return false, true
+	}
+	cmd := exec.CommandContext(ctx, "claude", "--print", "--dangerously-skip-permissions", goal)
+	cmd.Dir = targetPath
+	cmd.Env = append(os.Environ(), "HOME="+account.HomeDir, "USER=claude", "LOGNAME=claude")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			slog.Warn("Claude workspace goal timed out", "timeout", timeout)
+		} else {
+			slog.Warn("Claude workspace goal failed", "error", err)
+		}
+		return false, true
+	}
+	slog.Info("Claude workspace goal completed successfully")
 	return true, false
 }
 

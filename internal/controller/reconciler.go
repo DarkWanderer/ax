@@ -38,8 +38,12 @@ import (
 )
 
 const (
-	geminiSecretName = "gemini-api-secret"
-	geminiSecretKey  = "GEMINI_API_KEY"
+	geminiSecretName    = "gemini-api-secret"
+	geminiSecretKey     = "GEMINI_API_KEY"
+	claudeAgentEnv      = "AX_GOAL_AGENT"
+	claudeAgent         = "claude"
+	anthropicSecretName = "anthropic-api-secret"
+	anthropicSecretKey  = "ANTHROPIC_API_KEY"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -63,7 +67,7 @@ type TaskReconciler struct {
 	defaultTemplate         string
 	defaultTemplateAtespace string
 
-	// SecretResolver resolves the Gemini API key for task containers. It defaults
+	// SecretResolver resolves task API keys for task containers. It defaults
 	// to the Kubernetes secret lookup; tests replace it to avoid touching a cluster.
 	SecretResolver SecretResolver
 
@@ -149,7 +153,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, gat
 		}
 	}
 
-	if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
+	if extraEnv[claudeAgentEnv] == claudeAgent {
+		if anthropicKey := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey); anthropicKey != "" {
+			extraEnv[anthropicSecretKey] = anthropicKey
+		}
+	} else if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
 		extraEnv[geminiSecretKey] = geminiKey
 	}
 
@@ -369,19 +377,28 @@ func (r *TaskReconciler) setCondition(task *v1alpha1.Task, condType, status, rea
 // Kubernetes secret in the task's atespace and falling back to the controller's own
 // environment. It returns "" when neither source has a value.
 func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) string {
-	if r.SecretResolver != nil {
-		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
-		defer cancel()
-		if key, err := r.SecretResolver(lookupCtx, atespace, geminiSecretName, geminiSecretKey); err == nil && key != "" {
-			slog.Info("resolved GEMINI_API_KEY from kubernetes secret for actor template", "atespace", atespace)
-			return key
-		}
+	if key := r.lookupSecret(ctx, atespace, geminiSecretName, geminiSecretKey); key != "" {
+		return key
 	}
 	if key := os.Getenv(geminiSecretKey); key != "" {
 		slog.Info("resolved GEMINI_API_KEY from controller environment for actor template")
 		return key
 	}
 	return ""
+}
+
+func (r *TaskReconciler) lookupSecret(ctx context.Context, atespace, secretName, secretKey string) string {
+	if r.SecretResolver == nil {
+		return ""
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+	defer cancel()
+	key, err := r.SecretResolver(lookupCtx, atespace, secretName, secretKey)
+	if err != nil || key == "" {
+		return ""
+	}
+	slog.Info("resolved task API key from kubernetes secret for actor template", "atespace", atespace, "secret", secretName)
+	return key
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
