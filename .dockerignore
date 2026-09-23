@@ -4,8 +4,6 @@
 .claude
 *.log
 tmp/
-bin/
 ax
 ax-server
-ax-task-runner
 ax-controller
