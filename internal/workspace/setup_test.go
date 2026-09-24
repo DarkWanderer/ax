@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -299,5 +300,36 @@ func TestRunGoalClaudeWithoutAnthropicKeyDoesNotUseGemini(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); !os.IsNotExist(err) {
 		t.Fatalf("goal marker exists without completion: %v", err)
+	}
+}
+
+func TestRunGoalClaudePassesPromptOnStdin(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  *"create greeting"*) exit 2 ;;
+esac
+IFS= read -r prompt || true
+[ "$prompt" = "create greeting" ]
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+	if !workspace.RunGoal(context.Background(), path, "create greeting") {
+		t.Fatal("Claude goal did not complete")
+	}
+	marker := filepath.Join(stateDir, workspace.MarkerName(path)+".goal")
+	content, err := os.ReadFile(marker)
+	if err != nil || !strings.Contains(string(content), "goal: create greeting") {
+		t.Fatalf("goal marker missing or incorrect: %v", err)
 	}
 }

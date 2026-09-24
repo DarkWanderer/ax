@@ -385,8 +385,9 @@ func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool,
 	// gVisor disallows setuid in this sandbox. Allow only the tools this coding
 	// goal needs and decline any other permission request without prompting.
 	cmd := exec.CommandContext(ctx, "claude", "--print", "--permission-mode", "dontAsk",
-		"--permission-prompts", "none", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep", goal)
+		"--permission-prompts", "none", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep")
 	cmd.Dir = targetPath
+	cmd.Stdin = strings.NewReader(goal)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
