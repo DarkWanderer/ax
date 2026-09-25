@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,166 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
+
+type fakeInstallationTokens struct {
+	minted       int
+	revoked      []string
+	repositories []string
+}
+
+func (f *fakeInstallationTokens) Mint(_ context.Context, app *v1alpha1.GitHubAppCredential, _ string) (string, error) {
+	f.minted++
+	f.repositories = append([]string(nil), app.GetRepositories()...)
+	return "ghs_test_token_" + string(rune('0'+f.minted)), nil
+}
+func (f *fakeInstallationTokens) Revoke(_ context.Context, token string) error {
+	f.revoked = append(f.revoked, token)
+	return nil
+}
+
+func TestCredentialedTaskLifecycleAcrossWorkspaces(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, atespace, name, key string) (string, error) {
+		if name != "app-key" {
+			return "", nil
+		}
+		if atespace != "team" || key != "pem" {
+			t.Fatalf("wrong secret lookup %s/%s/%s", atespace, name, key)
+		}
+		return "private-key", nil
+	}
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"first", "second", "third"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}, Workspaces: []*v1alpha1.WorkspaceRef{{Name: "one"}, {Name: "two"}}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+	ws1 := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com/org/first.git"}, {Repo: "https://github.com/org/second.git"}}}}
+	ws2 := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "two"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com/org/third.git"}}}}
+	ws2.Spec.Git[0].Repo = "https://github.com/org/unlisted-private.git"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err == nil || fake.minted != 0 {
+		t.Fatalf("unlisted repository should fail before mint: %v", err)
+	}
+	ws2.Spec.Git[0].Repo = "https://github.com/org/third.git"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 1 || len(fake.repositories) != 3 {
+		t.Fatalf("minted=%d repos=%v", fake.minted, fake.repositories)
+	}
+	initialTemplate := mock.actor.GetActorTemplate().GetName()
+	var workspaceYAML, taskYAML, token string
+	for _, e := range mock.createdTemplates[0].GetContainers()[0].GetEnv() {
+		switch e.GetName() {
+		case "AX_WORKSPACES_YAML":
+			workspaceYAML = e.GetValue()
+		case "AX_TASK_YAML":
+			taskYAML = e.GetValue()
+		case "GITHUB_TOKEN":
+			token = e.GetValue()
+		}
+	}
+	for _, repo := range []string{"first.git", "second.git", "third.git"} {
+		if !strings.Contains(workspaceYAML, repo) {
+			t.Errorf("workspace YAML missing %s", repo)
+		}
+	}
+	if token == "" || strings.Contains(taskYAML, token) {
+		t.Fatal("token missing from template or present in Task YAML")
+	}
+	for _, e := range mock.createdTemplates[0].GetContainers()[0].GetEnv() {
+		if e.GetName() == "GITHUB_TOKEN" {
+			e.Value = ""
+			if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err == nil {
+				t.Fatal("running actor without token used uncredentialed fallback")
+			}
+			e.Value = token
+			break
+		}
+	}
+	for _, e := range mock.createdTemplates[0].GetContainers()[0].GetEnv() {
+		if strings.Contains(e.GetValue(), "private-key") {
+			t.Fatal("GitHub App private key entered actor template")
+		}
+	}
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 1 {
+		t.Fatalf("reconciliation minted %d tokens", fake.minted)
+	}
+	task.Status.Phase = "Suspended"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.revoked) != 1 || fake.revoked[0] != token {
+		t.Fatalf("revoked=%v", fake.revoked)
+	}
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.revoked) != 1 {
+		t.Fatalf("repeat suspension revoked again: %v", fake.revoked)
+	}
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 2 || mock.actor.GetActorTemplate().GetName() == initialTemplate {
+		t.Fatalf("resume did not rotate template: mint=%d template=%s", fake.minted, mock.actor.GetActorTemplate().GetName())
+	}
+	if len(mock.createdActors) != 1 {
+		t.Fatalf("durable actor was recreated: %v", mock.createdActors)
+	}
+}
+
+func TestCredentialedWorkspaceFailureFailsTask(t *testing.T) {
+	ready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusFailedDependency) }))
+	defer ready.Close()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{workerIP: strings.TrimPrefix(ready.URL, "http://")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "key" {
+			return "private-key", nil
+		}
+		return "", nil
+	}
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Phase: "Running"}}
+	got, err := r.ReconcileWithProvider(context.Background(), task, provider)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("failed workspace was not reported: task=%v err=%v", got, err)
+	}
+}
 
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
@@ -47,6 +208,7 @@ type mockControlServer struct {
 	crashedActor     string
 	revertedActors   []string
 	createdTemplates []*ateapipb.ActorTemplate
+	actor            *ateapipb.Actor
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -56,6 +218,11 @@ func noSecrets(context.Context, string, string, string) (string, error) {
 
 func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	ref := req.GetActorTemplate()
+	for _, tmpl := range m.createdTemplates {
+		if tmpl.GetMetadata().GetName() == ref.GetName() {
+			return tmpl, nil
+		}
+	}
 	if !m.actorTemplates[ref.GetName()] {
 		return nil, status.Error(codes.NotFound, "template not found")
 	}
@@ -82,6 +249,9 @@ func (m *mockControlServer) CreateAtespace(ctx context.Context, req *ateapipb.Cr
 }
 
 func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+	if m.actor != nil {
+		return nil, status.Error(codes.AlreadyExists, "exists")
+	}
 	name := ""
 	if req.Actor != nil && req.Actor.Metadata != nil {
 		name = req.Actor.Metadata.Name
@@ -90,12 +260,18 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	m.createdActors = append(m.createdActors, name)
-	return &ateapipb.Actor{
-		Metadata: &ateapipb.ResourceMetadata{Name: name},
+	m.actor = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name, Atespace: req.Actor.GetMetadata().GetAtespace()}, ActorTemplate: req.Actor.GetActorTemplate(),
 		Status: &ateapipb.ActorStatus{
 			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
 		},
-	}, nil
+	}
+	return m.actor, nil
+}
+
+func (m *mockControlServer) UpdateActor(_ context.Context, req *ateapipb.UpdateActorRequest) (*ateapipb.Actor, error) {
+	m.actor = req.Actor
+	return m.actor, nil
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
@@ -104,6 +280,9 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 		name = req.Actor.Name
 	}
 	m.resumedActors = append(m.resumedActors, name)
+	if m.actor != nil {
+		m.actor.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+	}
 	wIP := "10.244.1.42"
 	if m.workerIP != "" {
 		wIP = m.workerIP
@@ -129,6 +308,9 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 		name = req.Actor.Name
 	}
 	m.suspendedActors = append(m.suspendedActors, name)
+	if m.actor != nil {
+		m.actor.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	}
 	return &ateapipb.SuspendActorResponse{}, nil
 }
 
@@ -145,6 +327,7 @@ func (m *mockControlServer) RevertActor(_ context.Context, req *ateapipb.RevertA
 func (m *mockControlServer) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
 	name := req.GetActor().GetName()
 	m.deletedActors = append(m.deletedActors, name)
+	m.actor = nil
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
 }
 
@@ -163,6 +346,9 @@ func (m *mockControlServer) GetActor(ctx context.Context, req *ateapipb.GetActor
 		if del == name {
 			return nil, status.Errorf(codes.NotFound, "actor %q not found", name)
 		}
+	}
+	if m.actor != nil && m.actor.GetMetadata().GetName() == name {
+		return m.actor, nil
 	}
 	for _, a := range m.createdActors {
 		if a == name {

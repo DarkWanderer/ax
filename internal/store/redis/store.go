@@ -551,3 +551,140 @@ func (s *Store) WatchTask(ctx context.Context, atespace, name string) (<-chan *v
 func (s *Store) Close() error {
 	return s.client.Close()
 }
+
+// SaveCredentialProvider stores a credentialProvider.
+func (s *Store) SaveCredentialProvider(ctx context.Context, credentialProvider *v1alpha1.CredentialProvider) error {
+	if credentialProvider.Metadata == nil {
+		credentialProvider.Metadata = &v1alpha1.ObjectMeta{}
+	}
+	if credentialProvider.Metadata.Name == "" {
+		return errors.New("credentialProvider name is required")
+	}
+	if credentialProvider.Metadata.Atespace == "" {
+		credentialProvider.Metadata.Atespace = "default"
+	}
+	if credentialProvider.ApiVersion == "" {
+		credentialProvider.ApiVersion = v1alpha1.APIVersion
+	}
+	if credentialProvider.Kind == "" {
+		credentialProvider.Kind = v1alpha1.KindCredentialProvider
+	}
+
+	data, err := protojson.Marshal(credentialProvider)
+	if err != nil {
+		return fmt.Errorf("marshaling credentialProvider: %w", err)
+	}
+
+	atespace := credentialProvider.Metadata.Atespace
+	name := credentialProvider.Metadata.Name
+	score := float64(time.Now().UnixNano())
+	member := fmt.Sprintf("%s:%s", atespace, name)
+
+	pipe := s.client.TxPipeline()
+	pipe.Set(ctx, s.credentialProviderKey(atespace, name), data, 0)
+	pipe.ZAdd(ctx, s.credentialProviderIndexKey(), redis.Z{Score: score, Member: member})
+	pipe.ZAdd(ctx, s.credentialProviderAtespaceIndexKey(atespace), redis.Z{Score: score, Member: name})
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// DeleteCredentialProvider removes a credentialProvider.
+func (s *Store) DeleteCredentialProvider(ctx context.Context, atespace, name string) error {
+	if atespace == "" {
+		atespace = "default"
+	}
+	member := fmt.Sprintf("%s:%s", atespace, name)
+
+	pipe := s.client.TxPipeline()
+	pipe.Del(ctx, s.credentialProviderKey(atespace, name))
+	pipe.ZRem(ctx, s.credentialProviderIndexKey(), member)
+	pipe.ZRem(ctx, s.credentialProviderAtespaceIndexKey(atespace), name)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// ListCredentialProviders lists credentialProviders for an atespace or across all atespaces.
+func (s *Store) ListCredentialProviders(ctx context.Context, atespace string) ([]*v1alpha1.CredentialProvider, error) {
+	var members []string
+	var err error
+
+	if atespace == "" || atespace == "*" {
+		members, err = s.client.ZRevRange(ctx, s.credentialProviderIndexKey(), 0, -1).Result()
+	} else {
+		names, nErr := s.client.ZRevRange(ctx, s.credentialProviderAtespaceIndexKey(atespace), 0, -1).Result()
+		if nErr == nil {
+			for _, n := range names {
+				members = append(members, fmt.Sprintf("%s:%s", atespace, n))
+			}
+		}
+		err = nErr
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("listing credentialProvider index: %w", err)
+	}
+	if len(members) == 0 {
+		return []*v1alpha1.CredentialProvider{}, nil
+	}
+
+	keys := make([]string, len(members))
+	for i, m := range members {
+		parts := strings.SplitN(m, ":", 2)
+		if len(parts) == 2 {
+			keys[i] = s.credentialProviderKey(parts[0], parts[1])
+		} else {
+			keys[i] = s.credentialProviderKey("default", m)
+		}
+	}
+
+	vals, err := s.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("batch fetching credentialProviders: %w", err)
+	}
+
+	credentialProviders := make([]*v1alpha1.CredentialProvider, 0, len(vals))
+	for _, v := range vals {
+		if v == nil {
+			continue
+		}
+		str, ok := v.(string)
+		if !ok {
+			continue
+		}
+		var m v1alpha1.CredentialProvider
+		if err := jsonUnmarshalOpts.Unmarshal([]byte(str), &m); err == nil {
+			credentialProviders = append(credentialProviders, &m)
+		}
+	}
+	return credentialProviders, nil
+}
+
+// GetCredentialProvider retrieves a credentialProvider by atespace and name.
+func (s *Store) GetCredentialProvider(ctx context.Context, atespace, name string) (*v1alpha1.CredentialProvider, error) {
+	if atespace == "" {
+		atespace = "default"
+	}
+	val, err := s.client.Get(ctx, s.credentialProviderKey(atespace, name)).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, store.ErrNotFound
+		}
+		return nil, fmt.Errorf("getting credentialProvider from redis: %w", err)
+	}
+
+	var m v1alpha1.CredentialProvider
+	if err := jsonUnmarshalOpts.Unmarshal([]byte(val), &m); err != nil {
+		return nil, fmt.Errorf("unmarshaling credentialProvider: %w", err)
+	}
+	return &m, nil
+}
+
+func (s *Store) credentialProviderKey(atespace, name string) string {
+	return fmt.Sprintf("%s:credential-provider:%s:%s", s.opts.KeyPrefix, atespace, name)
+}
+func (s *Store) credentialProviderIndexKey() string {
+	return fmt.Sprintf("%s:credential-providers:index", s.opts.KeyPrefix)
+}
+func (s *Store) credentialProviderAtespaceIndexKey(atespace string) string {
+	return fmt.Sprintf("%s:credential-providers:atespace:%s", s.opts.KeyPrefix, atespace)
+}

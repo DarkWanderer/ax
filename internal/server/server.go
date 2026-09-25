@@ -17,6 +17,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -33,6 +34,7 @@ import (
 // Reconciler coordinates sandbox/actor lifecycles on Agent Substrate directly.
 type Reconciler interface {
 	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
+	ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
 	ReconcileDelete(ctx context.Context, atespace, taskName string) error
 }
 
@@ -168,6 +170,15 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
 	}
 
+	if ref := task.GetSpec().GetCredentialProvider(); ref != nil {
+		if _, err := s.store.GetCredentialProvider(ctx, atespace, ref.Name); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, status.Error(codes.InvalidArgument, "credential provider not found in task atespace")
+			}
+			return nil, status.Errorf(codes.Internal, "checking credential provider: %v", err)
+		}
+	}
+
 	if task.Metadata.CreationTimestamp == nil {
 		task.Metadata.CreationTimestamp = timestamppb.Now()
 	}
@@ -182,7 +193,14 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
+		if err != nil {
+			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
+			task.Status.Phase = "Failed"
+			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
 			task.Status.Phase = "Failed"
@@ -285,7 +303,11 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
 		}
@@ -333,7 +355,13 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
+		if err != nil {
+			task.Status.Phase = "Failed"
+			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)
 		if err != nil {
 			task.Status.Phase = "Failed"
 			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
@@ -366,6 +394,21 @@ func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1a
 		}
 	}
 	return workspaces
+}
+
+// fetchCredentialProvider resolves the CredentialProvider a task's spec
+// references, so the reconciler can mint a fresh installation token for it.
+// A task without spec.credentialProvider gets a nil provider.
+func (s *Server) fetchCredentialProvider(ctx context.Context, atespace string, task *v1alpha1.Task) (*v1alpha1.CredentialProvider, error) {
+	ref := task.GetSpec().GetCredentialProvider()
+	if ref == nil {
+		return nil, nil
+	}
+	provider, err := s.store.GetCredentialProvider(ctx, atespace, ref.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("fetching credential provider %s: %w", ref.GetName(), err)
+	}
+	return provider, nil
 }
 
 func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse]) error {

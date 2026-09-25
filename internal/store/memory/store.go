@@ -39,20 +39,22 @@ func clone[T proto.Message](m T) T {
 
 // MemoryStore is an in-memory implementation of store.Store for testing and single-node setups.
 type MemoryStore struct {
-	mu         sync.RWMutex
-	tasks      map[string]*v1alpha1.Task
-	models     map[string]*v1alpha1.Model
-	workspaces map[string]*v1alpha1.Workspace
-	watchers   map[string][]chan *v1alpha1.Task
+	mu                  sync.RWMutex
+	tasks               map[string]*v1alpha1.Task
+	models              map[string]*v1alpha1.Model
+	credentialProviders map[string]*v1alpha1.CredentialProvider
+	workspaces          map[string]*v1alpha1.Workspace
+	watchers            map[string][]chan *v1alpha1.Task
 }
 
 // NewStore creates a new in-memory Store.
 func NewStore() *MemoryStore {
 	return &MemoryStore{
-		tasks:      make(map[string]*v1alpha1.Task),
-		models:     make(map[string]*v1alpha1.Model),
-		workspaces: make(map[string]*v1alpha1.Workspace),
-		watchers:   make(map[string][]chan *v1alpha1.Task),
+		tasks:               make(map[string]*v1alpha1.Task),
+		models:              make(map[string]*v1alpha1.Model),
+		credentialProviders: make(map[string]*v1alpha1.CredentialProvider),
+		workspaces:          make(map[string]*v1alpha1.Workspace),
+		watchers:            make(map[string][]chan *v1alpha1.Task),
 	}
 }
 

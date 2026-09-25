@@ -142,6 +142,9 @@ func Run(ctx context.Context, cfg Config) error {
 	for _, e := range cfg.Task.GetSpec().GetEnv() {
 		_ = os.Setenv(e.GetName(), e.GetValue())
 	}
+	if os.Getenv("GITHUB_TOKEN") != "" {
+		configureGitCredentials()
+	}
 
 	metaServer := metadata.NewServer(port, cfg.Task, workspaces, metadata.ServerOptions{WorkspacePath: wsPath})
 	if err := metaServer.Start(); err != nil {
@@ -154,8 +157,19 @@ func Run(ctx context.Context, cfg Config) error {
 
 	ready := true
 	for _, m := range mounts {
-		if _, err := workspace.PrepareWorkspace(ctx, m.ws, m.path); err != nil {
+		var err error
+		if cfg.Task.GetSpec().GetCredentialProvider() != nil {
+			_, err = workspace.PrepareWorkspaceStrict(ctx, m.ws, m.path)
+		} else {
+			_, err = workspace.PrepareWorkspace(ctx, m.ws, m.path)
+		}
+		if err != nil {
 			slog.Error("workspace maiden run setup failed", "workspace", m.ref.GetName(), "path", m.path, "error", err)
+			if cfg.Task.GetSpec().GetCredentialProvider() != nil {
+				metaServer.SetWorkspaceFailed()
+				<-ctx.Done()
+				return fmt.Errorf("credentialed workspace setup failed: %w", err)
+			}
 			ready = false
 		}
 	}

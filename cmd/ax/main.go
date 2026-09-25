@@ -301,6 +301,19 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 		res, err := client.UpdateModel(ctx, &v1alpha1.UpdateModelRequest{Model: &m})
 		return head.Kind, res.GetMetadata().GetName(), outcome, err
 
+	case v1alpha1.KindCredentialProvider:
+		var p v1alpha1.CredentialProvider
+		if err := doc.Decode(&p); err != nil {
+			return "", "", "", err
+		}
+		existing, err := client.GetCredentialProvider(ctx, &v1alpha1.GetCredentialProviderRequest{Atespace: p.GetMetadata().GetAtespace(), Name: p.GetMetadata().GetName()})
+		outcome, err := applyOutcome(err, existing.GetSpec(), p.GetSpec())
+		if err != nil {
+			return "", "", "", err
+		}
+		res, err := client.UpdateCredentialProvider(ctx, &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: &p})
+		return head.Kind, res.GetMetadata().GetName(), outcome, err
+
 	case "":
 		return "", "", "", errors.New("missing kind")
 	default:
@@ -487,6 +500,25 @@ func runGet(serverURL, atespace string, args []string) error {
 		}
 
 		return yaml.NewEncoder(os.Stdout).Encode(m)
+	}
+	if resource == "credentialproviders" || resource == "credentialprovider" && len(args) == 1 {
+		resp, err := client.ListCredentialProviders(ctx, &v1alpha1.ListCredentialProvidersRequest{Atespace: atespace})
+		if err != nil {
+			return fmt.Errorf("listing credential providers: %w", err)
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 8, 3, ' ', 0)
+		fmt.Fprintln(w, "NAME\tATESPACE\tREPOSITORIES")
+		for _, p := range resp.GetCredentialProviders() {
+			fmt.Fprintf(w, "%s\t%s\t%d\n", p.GetMetadata().GetName(), p.GetMetadata().GetAtespace(), len(p.GetSpec().GetGithubApp().GetRepositories()))
+		}
+		return w.Flush()
+	}
+	if (resource == "credentialprovider" || resource == "credentialproviders") && len(args) >= 2 {
+		p, err := client.GetCredentialProvider(ctx, &v1alpha1.GetCredentialProviderRequest{Atespace: atespace, Name: args[1]})
+		if err != nil {
+			return fmt.Errorf("getting credential provider %q: %w", args[1], err)
+		}
+		return yaml.NewEncoder(os.Stdout).Encode(p)
 	}
 
 	return fmt.Errorf("unknown resource %q", resource)
@@ -759,6 +791,8 @@ func deleteResource(ctx context.Context, client v1alpha1.AXClient, kind, atespac
 		_, err = client.DeleteWorkspace(ctx, &v1alpha1.DeleteWorkspaceRequest{Atespace: atespace, Name: name})
 	case v1alpha1.KindModel:
 		_, err = client.DeleteModel(ctx, &v1alpha1.DeleteModelRequest{Atespace: atespace, Name: name})
+	case v1alpha1.KindCredentialProvider:
+		_, err = client.DeleteCredentialProvider(ctx, &v1alpha1.DeleteCredentialProviderRequest{Atespace: atespace, Name: name})
 	default:
 		return fmt.Errorf("unsupported kind %q", kind)
 	}
@@ -780,6 +814,8 @@ func normalizeKind(kind string) (string, error) {
 		return v1alpha1.KindWorkspace, nil
 	case "model":
 		return v1alpha1.KindModel, nil
+	case "credentialprovider":
+		return v1alpha1.KindCredentialProvider, nil
 	case "":
 		return "", errors.New("missing kind")
 	default:

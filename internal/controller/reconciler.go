@@ -22,12 +22,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/credentials"
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -63,6 +66,11 @@ const (
 // SecretResolver looks up a key from a Kubernetes secret in the given namespace.
 type SecretResolver func(ctx context.Context, namespace, secretName, key string) (string, error)
 
+type InstallationTokens interface {
+	Mint(context.Context, *v1alpha1.GitHubAppCredential, string) (string, error)
+	Revoke(context.Context, string) error
+}
+
 // TaskReconciler reconciles Task resources by provisioning and orchestrating
 // sandboxed Actors on Agent Substrate.
 type TaskReconciler struct {
@@ -73,7 +81,8 @@ type TaskReconciler struct {
 
 	// SecretResolver resolves task API keys for task containers. It defaults
 	// to the Kubernetes secret lookup; tests replace it to avoid touching a cluster.
-	SecretResolver SecretResolver
+	SecretResolver     SecretResolver
+	InstallationTokens InstallationTokens
 
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
@@ -94,12 +103,17 @@ func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplat
 		defaultTemplate:         defaultTemplate,
 		defaultTemplateAtespace: defaultTemplateAtespace,
 		SecretResolver:          model.GetKubernetesSecret,
+		InstallationTokens:      &credentials.GitHubClient{},
 		WorkspaceReadyTimeout:   defaultWorkspaceReadyTimeout,
 	}
 }
 
 // Reconcile handles the reconciliation loop for a single Task.
 func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+	return r.ReconcileWithProvider(ctx, task, nil, workspaces...)
+}
+
+func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
 	}
@@ -138,6 +152,56 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	if task.Status.Id == "" {
 		task.Status.Id = fmt.Sprintf("task-%s-%d", task.Metadata.Name, now.Unix())
 	}
+	if ref := task.Spec.GetCredentialProvider(); ref != nil {
+		if provider == nil || provider.GetMetadata().GetName() != ref.GetName() || provider.GetMetadata().GetAtespace() != atespace {
+			return r.credentialFailure(task, "credential provider is missing from the task atespace", now)
+		}
+		if err := v1alpha1.ValidateCredentialProvider(provider); err != nil {
+			return r.credentialFailure(task, err.Error(), now)
+		}
+		if err := validateCredentialedWorkspaces(provider, workspaces); err != nil {
+			return r.credentialFailure(task, err.Error(), now)
+		}
+	}
+	var existingActor *ateapipb.Actor
+	if provider != nil {
+		actor, err := r.client.GetActor(ctx, atespace, actorName)
+		if err != nil && status.Code(err) != codes.NotFound {
+			return r.credentialFailure(task, "could not inspect actor", now)
+		}
+		existingActor = actor
+		taskSuspending := task.Status.Phase == "Suspended"
+		if actor != nil && (actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING || actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING) && !taskSuspending {
+			token, err := r.actorToken(ctx, actor)
+			if err != nil || token == "" {
+				return r.credentialFailure(task, "running actor has no GitHub installation token; suspend and resume the task", now)
+			}
+		}
+		// Only an already-provisioned actor needs an explicit suspend-and-revoke;
+		// a task that starts out suspended (fresh create) still needs its actor
+		// provisioned below, and gets suspended by the generic phase handling.
+		if taskSuspending && actor != nil {
+			suspended := actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+			if !suspended {
+				if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
+					return r.credentialFailure(task, "could not suspend actor", now)
+				}
+			}
+			// A failed revoke leaves the actor suspended but the Task failed;
+			// retry revocation on the next reconciliation.
+			if !suspended || task.Status.Phase != "Suspended" {
+				if token, err := r.actorToken(ctx, actor); err != nil {
+					return r.credentialFailure(task, "could not read actor token for revocation", now)
+				} else if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
+					return r.credentialFailure(task, "could not revoke installation token", now)
+				}
+			}
+			task.Status.WorkerIp = ""
+			task.Status.Phase = "Suspended"
+			r.setCondition(task, condReady, "False", "TaskSuspended", "Task is suspended", now)
+			return task, nil
+		}
+	}
 
 	// 3. Ensure Actor exists on Substrate
 	templateName := r.defaultTemplate
@@ -154,6 +218,24 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			if e.Name != "" {
 				extraEnv[e.Name] = e.Value
 			}
+		}
+	}
+	newToken := ""
+	if provider != nil {
+		state := existingActor.GetStatus().GetState()
+		if existingActor == nil || (state != ateapipb.ActorState_ACTOR_STATE_RUNNING && state != ateapipb.ActorState_ACTOR_STATE_RESUMING) {
+			keyRef := provider.GetSpec().GetGithubApp().GetPrivateKeySecret()
+			secretCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+			privateKey, err := r.SecretResolver(secretCtx, atespace, keyRef.GetName(), keyRef.GetKey())
+			cancel()
+			if err != nil || privateKey == "" {
+				return r.credentialFailure(task, "could not read GitHub App private key", now)
+			}
+			newToken, err = r.InstallationTokens.Mint(ctx, provider.GetSpec().GetGithubApp(), privateKey)
+			if err != nil {
+				return r.credentialFailure(task, "could not mint GitHub installation token", now)
+			}
+			extraEnv["GITHUB_TOKEN"] = newToken
 		}
 	}
 
@@ -185,12 +267,15 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	}
 
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
-	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
+	if !(provider != nil && newToken == "" && existingActor != nil) && task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
 
 		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
-		if err != nil {
+		if err != nil && provider != nil {
+			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			return r.credentialFailure(task, "could not create credentialed actor template", now)
+		} else if err != nil {
 			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
 		} else if tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
@@ -198,9 +283,18 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
 		}
 	}
+	if provider != nil && existingActor != nil && newToken != "" && (existingActor.GetActorTemplate().GetName() != templateName || existingActor.GetActorTemplate().GetAtespace() != templateAtespace) {
+		if _, err := r.client.SetActorTemplate(ctx, existingActor, templateAtespace, templateName); err != nil {
+			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			return r.credentialFailure(task, "could not switch actor template", now)
+		}
+	}
 
 	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
 	if err != nil {
+		if newToken != "" {
+			_ = r.InstallationTokens.Revoke(ctx, newToken)
+		}
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
@@ -224,6 +318,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	slog.Info("resuming actor on Substrate worker", "actor", actorName)
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
+		if newToken != "" {
+			_ = r.InstallationTokens.Revoke(ctx, newToken)
+		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("resuming actor: %w", err)
@@ -243,6 +340,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := r.conditionTrue(task, condWorkspaceReady)
+	workspaceFailed := false
 	if workerIP != "" && !workspaceReady {
 		// Poll briefly for workspace setup completion
 		pollCtx, cancel := context.WithTimeout(ctx, r.WorkspaceReadyTimeout)
@@ -256,6 +354,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
 			if resp, err := r.httpClient.Do(req); err == nil {
 				_ = resp.Body.Close()
+				if provider != nil && resp.StatusCode == http.StatusFailedDependency {
+					workspaceFailed = true
+					return false
+				}
 				if resp.StatusCode == http.StatusOK {
 					return true
 				}
@@ -268,6 +370,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
 					if resp, err := r.httpClient.Do(rReq); err == nil {
 						_ = resp.Body.Close()
+						if provider != nil && resp.StatusCode == http.StatusFailedDependency {
+							workspaceFailed = true
+							return false
+						}
 						if resp.StatusCode == http.StatusOK {
 							return true
 						}
@@ -279,8 +385,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 		// Initial check
 		workspaceReady = checkReady()
+		if workspaceFailed {
+			goto DonePolling
+		}
 
-		for !workspaceReady {
+		for !workspaceReady && !workspaceFailed {
 			select {
 			case <-pollCtx.Done():
 				goto DonePolling
@@ -293,6 +402,15 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		}
 	}
 DonePolling:
+	if workspaceFailed {
+		return r.credentialFailure(task, "credentialed workspace setup failed", time.Now())
+	}
+	if provider != nil && !workspaceReady {
+		actor, err := r.client.GetActor(ctx, atespace, actorName)
+		if err == nil && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+			return r.credentialFailure(task, "credentialed actor failed during workspace setup", time.Now())
+		}
+	}
 
 	// The task is Ready only once its actor is running and the workspace inside it is set up.
 	if workspaceReady {
@@ -329,6 +447,61 @@ const (
 // workspace setup is a one-time step whose result outlives actor failures and suspends.
 func (r *TaskReconciler) setNotReady(task *v1alpha1.Task, reason, message string, t time.Time) {
 	r.setCondition(task, condReady, "False", reason, message, t)
+}
+
+func (r *TaskReconciler) credentialFailure(task *v1alpha1.Task, message string, now time.Time) (*v1alpha1.Task, error) {
+	task.Status.Phase = "Failed"
+	r.setNotReady(task, "CredentialFailed", message, now)
+	return task, errors.New(message)
+}
+
+func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, workspaces []*v1alpha1.Workspace) error {
+	allowed := make(map[string]bool)
+	for _, name := range provider.GetSpec().GetGithubApp().GetRepositories() {
+		allowed[strings.ToLower(name)] = true
+	}
+	for _, ws := range workspaces {
+		for _, repo := range ws.GetSpec().GetGit() {
+			raw := repo.GetRepo()
+			if strings.HasPrefix(raw, "git@github.com:") || strings.HasPrefix(raw, "ssh://git@github.com/") {
+				return fmt.Errorf("credentialed GitHub repository must use HTTPS")
+			}
+			u, err := url.Parse(raw)
+			if err != nil {
+				return fmt.Errorf("invalid Git repository URL")
+			}
+			if !strings.EqualFold(u.Hostname(), "github.com") {
+				continue
+			}
+			if u.Scheme != "https" || u.User != nil {
+				return fmt.Errorf("credentialed GitHub repository must use HTTPS without embedded credentials")
+			}
+			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+			if len(parts) != 2 || !allowed[strings.ToLower(strings.TrimSuffix(parts[1], ".git"))] {
+				return fmt.Errorf("GitHub repository is not listed in the credential provider")
+			}
+		}
+	}
+	return nil
+}
+
+func (r *TaskReconciler) actorToken(ctx context.Context, actor *ateapipb.Actor) (string, error) {
+	ref := actor.GetActorTemplate()
+	if ref == nil {
+		return "", nil
+	}
+	tmpl, err := r.client.GetActorTemplate(ctx, ref.GetAtespace(), ref.GetName())
+	if err != nil {
+		return "", err
+	}
+	for _, container := range tmpl.GetContainers() {
+		for _, env := range container.GetEnv() {
+			if env.GetName() == "GITHUB_TOKEN" {
+				return env.GetValue(), nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // conditionTrue reports whether the task currently has the given condition with status True.
@@ -421,8 +594,24 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 		atespace = "default"
 	}
 	slog.Info("deleting Substrate actor for task", "atespace", atespace, "task", taskName)
+	actor, err := r.client.GetActor(ctx, atespace, taskName)
+	if err != nil && status.Code(err) != codes.NotFound {
+		return err
+	}
+	var token string
+	if actor != nil {
+		token, err = r.actorToken(ctx, actor)
+		if err != nil {
+			return fmt.Errorf("reading actor credential for revocation: %w", err)
+		}
+	}
 	if err := r.client.DeleteActor(ctx, atespace, taskName); err != nil {
 		return err
+	}
+	if token != "" {
+		if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
+			return fmt.Errorf("revoking actor credential: %w", err)
+		}
 	}
 	if err := r.deleteTaskTemplates(ctx, atespace, taskName); err != nil {
 		slog.Warn("could not clean up actor templates for task", "task", taskName, "error", err)

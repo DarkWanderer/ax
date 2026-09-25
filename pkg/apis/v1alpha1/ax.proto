@@ -48,6 +48,11 @@ service AX {
   rpc UpdateModel(UpdateModelRequest) returns (Model);
   rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
 
+  rpc GetCredentialProvider(GetCredentialProviderRequest) returns (CredentialProvider);
+  rpc ListCredentialProviders(ListCredentialProvidersRequest) returns (ListCredentialProvidersResponse);
+  rpc UpdateCredentialProvider(UpdateCredentialProviderRequest) returns (CredentialProvider);
+  rpc DeleteCredentialProvider(DeleteCredentialProviderRequest) returns (DeleteCredentialProviderResponse);
+
 }
 
 // ObjectMeta is metadata for AX resources.
@@ -78,6 +83,11 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 6;
+  CredentialProviderRef credential_provider = 7;
+}
+
+message CredentialProviderRef {
+  string name = 1;
 }
 
 message EnvVar {
@@ -217,6 +227,26 @@ message SecretKeyRef {
   string key = 2;
 }
 
+// --- CredentialProvider ---
+message CredentialProvider {
+  string api_version = 1;
+  string kind = 2;
+  ObjectMeta metadata = 3;
+  CredentialProviderSpec spec = 4;
+}
+
+message CredentialProviderSpec {
+  GitHubAppCredential github_app = 1;
+}
+
+message GitHubAppCredential {
+  int64 app_id = 1;
+  int64 installation_id = 2;
+  SecretKeyRef private_key_secret = 3;
+  repeated string repositories = 4;
+  map<string, string> permissions = 5;
+}
+
 // --- RPC Request & Response Messages ---
 
 // Tasks
@@ -316,3 +346,10 @@ message DeleteModelRequest {
 
 message DeleteModelResponse {}
 
+// CredentialProviders
+message GetCredentialProviderRequest { string atespace = 1; string name = 2; }
+message ListCredentialProvidersRequest { string atespace = 1; }
+message ListCredentialProvidersResponse { repeated CredentialProvider credential_providers = 1; }
+message UpdateCredentialProviderRequest { CredentialProvider credential_provider = 1; }
+message DeleteCredentialProviderRequest { string atespace = 1; string name = 2; }
+message DeleteCredentialProviderResponse {}

@@ -101,6 +101,16 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
 func PrepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string) (*SetupResult, error) {
+	return prepareWorkspace(ctx, ws, targetPath, false)
+}
+
+// PrepareWorkspaceStrict fails when any Git repository cannot be fetched.
+// Credentialed tasks use it so authentication errors fail the actor start.
+func PrepareWorkspaceStrict(ctx context.Context, ws *v1alpha1.Workspace, targetPath string) (*SetupResult, error) {
+	return prepareWorkspace(ctx, ws, targetPath, true)
+}
+
+func prepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath string, strict bool) (*SetupResult, error) {
 	if targetPath == "" {
 		targetPath = defaultWorkspacePath
 	}
@@ -136,6 +146,9 @@ func PrepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath st
 
 	if !gitOK {
 		slog.Warn("maiden run workspace setup completed with errors; marker omitted to allow retry", "path", targetPath)
+		if strict {
+			return res, fmt.Errorf("one or more Git repositories could not be fetched")
+		}
 		return res, nil
 	}
 

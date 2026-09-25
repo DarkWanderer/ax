@@ -113,6 +113,11 @@ func TestMetadataServer(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK after setup, got %d", resp.StatusCode)
 	}
+	srv.SetWorkspaceFailed()
+	resp, err = http.Get("http://127.0.0.1:9999/readyz?check=workspace")
+	if err != nil || resp.StatusCode != http.StatusFailedDependency {
+		t.Fatalf("expected 424 after setup failure, got %v %v", resp, err)
+	}
 
 	// Test /metadata/v1alpha1/ax/task
 	resp, err = http.Get("http://127.0.0.1:9999/metadata/v1alpha1/ax/task")

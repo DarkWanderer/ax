@@ -380,6 +380,16 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 	return actor, nil
 }
 
+// SetActorTemplate changes a suspended actor's template for its next resume.
+func (c *Client) SetActorTemplate(ctx context.Context, actor *ateapipb.Actor, atespace, name string) (*ateapipb.Actor, error) {
+	actor.ActorTemplate = &ateapipb.ObjectRef{Atespace: atespace, Name: name}
+	updated, err := c.control.UpdateActor(ctx, &ateapipb.UpdateActorRequest{Actor: actor})
+	if err != nil {
+		return nil, fmt.Errorf("updating actor template: %w", err)
+	}
+	return updated, nil
+}
+
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
 func (c *Client) ResumeActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, string, error) {
 	req := &ateapipb.ResumeActorRequest{

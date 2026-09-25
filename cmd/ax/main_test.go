@@ -218,6 +218,10 @@ func (f *fakeMainReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task,
 	return task, nil
 }
 
+func (f *fakeMainReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+	return task, nil
+}
+
 func (f *fakeMainReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string) error {
 	time.Sleep(100 * time.Millisecond)
 	close(f.deleted)

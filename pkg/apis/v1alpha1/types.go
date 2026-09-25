@@ -30,10 +30,11 @@ import (
 )
 
 const (
-	APIVersion    = "ax.io/v1alpha1"
-	KindTask      = "Task"
-	KindWorkspace = "Workspace"
-	KindModel     = "Model"
+	APIVersion             = "ax.io/v1alpha1"
+	KindTask               = "Task"
+	KindWorkspace          = "Workspace"
+	KindModel              = "Model"
+	KindCredentialProvider = "CredentialProvider"
 
 	DefaultTaskImage = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 
@@ -202,6 +203,41 @@ func (w *Workspace) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, 
 func (m *Model) MarshalYAML() (any, error)        { return marshalYAML(m) }
 func (m *Model) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, m, normalizeModel) }
 
+func (p *CredentialProvider) MarshalYAML() (any, error)        { return marshalYAML(p) }
+func (p *CredentialProvider) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, p, nil) }
+
+// ValidateCredentialProvider enforces the GitHub installation token request's
+// limits before the provider can be used by a Task.
+func ValidateCredentialProvider(p *CredentialProvider) error {
+	app := p.GetSpec().GetGithubApp()
+	if app == nil || app.GetAppId() <= 0 || app.GetInstallationId() <= 0 {
+		return fmt.Errorf("spec.githubApp: positive appId and installationId are required")
+	}
+	if app.GetPrivateKeySecret().GetName() == "" || app.GetPrivateKeySecret().GetKey() == "" {
+		return fmt.Errorf("spec.githubApp.privateKeySecret: name and key are required")
+	}
+	if len(app.GetRepositories()) == 0 || len(app.GetRepositories()) > 500 {
+		return fmt.Errorf("spec.githubApp.repositories: must contain 1 to 500 names")
+	}
+	seen := map[string]bool{}
+	for _, name := range app.GetRepositories() {
+		folded := strings.ToLower(name)
+		if name == "" || strings.ContainsAny(name, "/ \\@") || seen[folded] {
+			return fmt.Errorf("spec.githubApp.repositories: invalid or duplicate name %q", name)
+		}
+		seen[folded] = true
+	}
+	if len(app.GetPermissions()) == 0 {
+		return fmt.Errorf("spec.githubApp.permissions: at least one permission is required")
+	}
+	for name, level := range app.GetPermissions() {
+		if name == "" || (level != "read" && level != "write" && level != "admin") {
+			return fmt.Errorf("spec.githubApp.permissions: invalid permission %q=%q", name, level)
+		}
+	}
+	return nil
+}
+
 // Workspace bindings.
 //
 // A task binds one or more workspaces through spec.workspaces. Every entry is
@@ -313,6 +349,16 @@ func ValidateTask(t *Task) error {
 	spec := t.GetSpec()
 	if spec == nil {
 		return nil
+	}
+	if ref := spec.GetCredentialProvider(); ref != nil {
+		if ref.GetName() == "" || strings.Contains(ref.GetName(), "/") {
+			return fmt.Errorf("spec.credentialProvider.name: a local provider name is required")
+		}
+		for _, env := range spec.GetEnv() {
+			if env.GetName() == "GITHUB_TOKEN" {
+				return fmt.Errorf("spec.env: GITHUB_TOKEN cannot be set with credentialProvider")
+			}
+		}
 	}
 	refs := spec.WorkspaceRefs()
 	paths := spec.WorkspacePaths()

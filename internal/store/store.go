@@ -44,6 +44,11 @@ type Store interface {
 	ListModels(ctx context.Context, atespace string) ([]*v1alpha1.Model, error)
 	DeleteModel(ctx context.Context, atespace, name string) error
 
+	SaveCredentialProvider(ctx context.Context, provider *v1alpha1.CredentialProvider) error
+	GetCredentialProvider(ctx context.Context, atespace, name string) (*v1alpha1.CredentialProvider, error)
+	ListCredentialProviders(ctx context.Context, atespace string) ([]*v1alpha1.CredentialProvider, error)
+	DeleteCredentialProvider(ctx context.Context, atespace, name string) error
+
 	WatchTask(ctx context.Context, atespace, name string) (<-chan *v1alpha1.Task, io.Closer, error)
 	Close() error
 }

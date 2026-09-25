@@ -15,6 +15,7 @@
 package v1alpha1_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,47 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/yaml.v3"
 )
+
+func TestCredentialProviderValidation(t *testing.T) {
+	valid := func() *v1alpha1.CredentialProvider {
+		return &v1alpha1.CredentialProvider{Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{
+			AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"},
+			Repositories: []string{"one", "two"}, Permissions: map[string]string{"contents": "read"},
+		}}}
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*v1alpha1.CredentialProvider)
+	}{
+		{"duplicate", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.Repositories = []string{"one", "one"} }},
+		{"case-folded duplicate", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.Repositories = []string{"One", "one"} }},
+		{"oversized", func(p *v1alpha1.CredentialProvider) {
+			for i := 0; i < 501; i++ {
+				p.Spec.GithubApp.Repositories = append(p.Spec.GithubApp.Repositories, fmt.Sprintf("repo-%d", i))
+			}
+		}},
+		{"missing permissions", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.Permissions = nil }},
+		{"missing key", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret = nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := valid()
+			tc.change(p)
+			if err := v1alpha1.ValidateCredentialProvider(p); err == nil {
+				t.Fatal("expected invalid provider")
+			}
+		})
+	}
+	if err := v1alpha1.ValidateCredentialProvider(valid()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskRejectsProviderWithGitHubToken(t *testing.T) {
+	task := &v1alpha1.Task{Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "app"}, Env: []*v1alpha1.EnvVar{{Name: "GITHUB_TOKEN", Value: "manual"}}}}
+	if err := v1alpha1.ValidateTask(task); err == nil {
+		t.Fatal("expected conflicting token to be rejected")
+	}
+}
 
 // fullTask returns a Task with every field populated so round trips exercise
 // the whole schema, including timestamps and status.

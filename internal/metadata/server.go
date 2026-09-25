@@ -33,14 +33,15 @@ import (
 // Server is the cloud-style metadata server running inside the task actor container,
 // multiplexing HTTP metadata endpoints and guest gRPC daemon services on a single port.
 type Server struct {
-	port           int
-	server         *http.Server
-	grpcServer     *grpc.Server
-	grpcCleanup    func()
-	mu             sync.RWMutex
-	task           *v1alpha1.Task
-	workspaces     []*v1alpha1.Workspace
-	workspaceReady bool
+	port            int
+	server          *http.Server
+	grpcServer      *grpc.Server
+	grpcCleanup     func()
+	mu              sync.RWMutex
+	task            *v1alpha1.Task
+	workspaces      []*v1alpha1.Workspace
+	workspaceReady  bool
+	workspaceFailed bool
 }
 
 // ServerOptions configures optional settings for the metadata and guest server.
@@ -170,6 +171,14 @@ func (s *Server) SetWorkspaceReady(ready bool) {
 	s.workspaceReady = ready
 }
 
+// SetWorkspaceFailed reports a terminal workspace setup failure to AX while
+// keeping the guest process available for inspection and deletion.
+func (s *Server) SetWorkspaceFailed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspaceFailed = true
+}
+
 // IsWorkspaceReady returns whether the workspace setup has completed.
 func (s *Server) IsWorkspaceReady() bool {
 	s.mu.RLock()
@@ -199,7 +208,12 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("check") == "workspace" {
 		s.mu.RLock()
 		ready := s.workspaceReady
+		failed := s.workspaceFailed
 		s.mu.RUnlock()
+		if failed {
+			http.Error(w, "workspace setup failed", http.StatusFailedDependency)
+			return
+		}
 
 		if !ready {
 			http.Error(w, "workspace initializing", http.StatusServiceUnavailable)

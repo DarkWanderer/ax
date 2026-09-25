@@ -103,6 +103,18 @@ func TestServerGRPC(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("UpdateModel failed: %v", err)
 	}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "grpc-github"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one", "two"}, Permissions: map[string]string{"contents": "read"}}}}
+	if _, err := client.UpdateCredentialProvider(ctx, &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: provider}); err != nil {
+		t.Fatalf("UpdateCredentialProvider failed: %v", err)
+	}
+	gotProvider, err := client.GetCredentialProvider(ctx, &v1alpha1.GetCredentialProviderRequest{Atespace: "default", Name: "grpc-github"})
+	if err != nil || len(gotProvider.GetSpec().GetGithubApp().GetRepositories()) != 2 {
+		t.Fatalf("GetCredentialProvider: %v %v", gotProvider, err)
+	}
+	providers, err := client.ListCredentialProviders(ctx, &v1alpha1.ListCredentialProvidersRequest{Atespace: "default"})
+	if err != nil || len(providers.GetCredentialProviders()) != 1 {
+		t.Fatalf("ListCredentialProviders: %v %v", providers, err)
+	}
 	if _, err := client.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "grpc-task"},
 		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
@@ -316,6 +328,10 @@ type fakeReconciler struct {
 }
 
 func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+	return f.ReconcileWithProvider(ctx, task, nil, workspaces...)
+}
+
+func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	f.reconcileCount++
 	task.Status = &v1alpha1.TaskStatus{
 		Phase: task.GetStatus().GetPhase(),
