@@ -166,13 +166,15 @@ Usage:
   ax [command] [flags]
 
 Available Commands:
-  apply -f <file>         Apply resources (tasks, workspaces, models) from a file or stdin
+  apply -f <file>         Apply resources (tasks, workspaces, models, credential providers) from a file or stdin
   get tasks               List tasks
   get task <name>         Get a specific task
   get workspaces          List workspaces
   get workspace <name>    Get a specific workspace
   get models              List models
   get model <name>        Get a specific model
+  get credentialproviders List credential providers
+  get credentialprovider <name> Get a specific credential provider
   describe task <name>    Show detailed information about a task
   describe workspace <name> Show detailed information about a workspace
   describe model <name>   Show detailed information about a model
@@ -183,6 +185,7 @@ Available Commands:
   delete task <name>      Delete a task
   delete workspace <name> Delete a workspace
   delete model <name>     Delete a model
+  delete credentialprovider <name> Delete a credential provider
   ctx, context            Show active Kubernetes context and AX connection
   tunnel <list|stop>      Manage background tunnels to Kubernetes clusters
   version                 Print AX version
