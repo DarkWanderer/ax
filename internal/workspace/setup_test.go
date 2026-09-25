@@ -333,3 +333,35 @@ IFS= read -r prompt || true
 		t.Fatalf("goal marker missing or incorrect: %v", err)
 	}
 }
+
+func TestRunGoalClaudeUsesGatewayTokenAndModel(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "gateway-token")
+	t.Setenv("AX_CLAUDE_MODEL", "openrouter/free")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+case " $* " in
+  *" --model openrouter/free "*) ;;
+  *) exit 1 ;;
+esac
+IFS= read -r prompt || true
+[ "$prompt" = "create greeting" ]
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+	if !workspace.RunGoal(context.Background(), path, "create greeting") {
+		t.Fatal("Claude gateway goal did not complete")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); err != nil {
+		t.Fatalf("goal marker missing: %v", err)
+	}
+}

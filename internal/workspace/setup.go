@@ -52,6 +52,7 @@ const (
 	bootstrapAPIKeyEnv = "GEMINI_API_KEY"
 	goalAgentEnv       = "AX_GOAL_AGENT"
 	claudeAPIKeyEnv    = "ANTHROPIC_API_KEY"
+	claudeAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN"
 	// bootstrapTimeoutEnv overrides the default bootstrap timeout with a Go duration string.
 	bootstrapTimeoutEnv = "AX_BOOTSTRAP_TIMEOUT"
 	// bootstrapDataDir, under AXDir, is where the agent keeps its own state so
@@ -371,8 +372,8 @@ func runBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry
 
 // runClaudeBootstrap uses Claude Code inside the task sandbox after egress is ready.
 func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry bool) {
-	if os.Getenv(claudeAPIKeyEnv) == "" {
-		slog.Warn("workspace goal set but no Claude API key available", "env", claudeAPIKeyEnv)
+	if os.Getenv(claudeAPIKeyEnv) == "" && os.Getenv(claudeAuthTokenEnv) == "" {
+		slog.Warn("workspace goal set but no Claude credential available")
 		return false, false
 	}
 	if _, err := exec.LookPath("claude"); err != nil {
@@ -386,6 +387,9 @@ func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool,
 	// goal needs and decline any other permission request without prompting.
 	cmd := exec.CommandContext(ctx, "claude", "--print", "--permission-mode", "dontAsk",
 		"--permission-prompts", "none", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep")
+	if model := os.Getenv("AX_CLAUDE_MODEL"); model != "" {
+		cmd.Args = append(cmd.Args, "--model", model)
+	}
 	cmd.Dir = targetPath
 	cmd.Stdin = strings.NewReader(goal)
 	cmd.Stdout = os.Stdout

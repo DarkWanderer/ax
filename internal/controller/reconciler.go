@@ -38,12 +38,15 @@ import (
 )
 
 const (
-	geminiSecretName    = "gemini-api-secret"
-	geminiSecretKey     = "GEMINI_API_KEY"
-	claudeAgentEnv      = "AX_GOAL_AGENT"
-	claudeAgent         = "claude"
-	anthropicSecretName = "anthropic-api-secret"
-	anthropicSecretKey  = "ANTHROPIC_API_KEY"
+	geminiSecretName     = "gemini-api-secret"
+	geminiSecretKey      = "GEMINI_API_KEY"
+	claudeAgentEnv       = "AX_GOAL_AGENT"
+	claudeAgent          = "claude"
+	anthropicSecretName  = "anthropic-api-secret"
+	anthropicSecretKey   = "ANTHROPIC_API_KEY"
+	openRouterProvider   = "openrouter"
+	openRouterSecretName = "openrouter-api-secret"
+	openRouterSecretKey  = "OPENROUTER_API_KEY"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -154,7 +157,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, gat
 	}
 
 	if extraEnv[claudeAgentEnv] == claudeAgent {
-		if anthropicKey := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey); anthropicKey != "" {
+		if extraEnv["AX_CLAUDE_PROVIDER"] == openRouterProvider {
+			if openRouterKey := r.lookupSecret(ctx, atespace, openRouterSecretName, openRouterSecretKey); openRouterKey != "" {
+				extraEnv["ANTHROPIC_BASE_URL"] = "https://openrouter.ai/api"
+				extraEnv["ANTHROPIC_AUTH_TOKEN"] = openRouterKey
+				extraEnv[anthropicSecretKey] = ""
+			}
+		} else if anthropicKey := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey); anthropicKey != "" {
 			extraEnv[anthropicSecretKey] = anthropicKey
 		}
 	} else if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {

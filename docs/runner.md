@@ -19,6 +19,9 @@ The controller does not run `spec.command` as the container entrypoint. It alway
 | `spec.env` entries | Each one set directly in the container environment |
 | `GEMINI_API_KEY` | Set for the default Antigravity goal agent when the atespace has a Gemini credential configured |
 | `ANTHROPIC_API_KEY` | Set for `AX_GOAL_AGENT=claude` when the atespace has `anthropic-api-secret` |
+| `ANTHROPIC_AUTH_TOKEN` | Set from `openrouter-api-secret` when `AX_CLAUDE_PROVIDER=openrouter` |
+| `ANTHROPIC_BASE_URL` | Set to `https://openrouter.ai/api` for the OpenRouter provider |
+| `AX_CLAUDE_MODEL` | Optional model passed to Claude Code with `--model` |
 | Volume | A durable directory mounted at `/workspace` |
 | Readiness probe | `GET /readyz` on port 80 |
 

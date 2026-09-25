@@ -511,3 +511,56 @@ func TestTaskReconcilerClaudeCredential(t *testing.T) {
 		t.Error("Gemini key was included in Claude actor template")
 	}
 }
+
+func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	reconciler.SecretResolver = func(_ context.Context, atespace, name, key string) (string, error) {
+		if atespace != "default" || name != "openrouter-api-secret" || key != "OPENROUTER_API_KEY" {
+			t.Errorf("unexpected credential lookup: %s/%s key %s", atespace, name, key)
+			return "", nil
+		}
+		return "test-openrouter-key", nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "openrouter-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env: []*v1alpha1.EnvVar{
+				{Name: "AX_GOAL_AGENT", Value: "claude"},
+				{Name: "AX_CLAUDE_PROVIDER", Value: "openrouter"},
+			},
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+	env := map[string]string{}
+	for _, v := range mockSrv.createdTemplates[0].Containers[0].Env {
+		env[v.Name] = v.Value
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "test-openrouter-key" || env["ANTHROPIC_BASE_URL"] != "https://openrouter.ai/api" {
+		t.Error("OpenRouter configuration missing from Claude actor template")
+	}
+	if key, ok := env["ANTHROPIC_API_KEY"]; !ok || key != "" {
+		t.Error("Anthropic API key must be explicitly empty for OpenRouter")
+	}
+}
