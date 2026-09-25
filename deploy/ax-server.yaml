@@ -75,7 +75,7 @@ spec:
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
-            - "--template=default-template"
+            - "--template=default-template-v2"
             - "--template-atespace=ax-system"
           env:
             - name: ATENET_ROUTER_ADDR
@@ -146,4 +146,3 @@ spec:
       name: http
   selector:
     app.kubernetes.io/name: ax-server
-
