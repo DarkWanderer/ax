@@ -142,11 +142,13 @@ func TestCredentialedTaskLifecycleAcrossWorkspaces(t *testing.T) {
 	if len(fake.revoked) != 1 || fake.revoked[0] != token {
 		t.Fatalf("revoked=%v", fake.revoked)
 	}
+	// Revoke is idempotent, so a repeat suspend revoking the same
+	// already-void token again is harmless and expected.
 	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
 		t.Fatal(err)
 	}
-	if len(fake.revoked) != 1 {
-		t.Fatalf("repeat suspension revoked again: %v", fake.revoked)
+	if len(fake.revoked) != 2 || fake.revoked[1] != token {
+		t.Fatalf("revoked=%v, want the same token revoked again", fake.revoked)
 	}
 	task.Status.Phase = "Running"
 	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err != nil {
@@ -205,12 +207,14 @@ func TestCredentialedTaskCreatedSuspendedRevokesUnusedToken(t *testing.T) {
 		t.Fatalf("suspendedActors=%v, want the actor suspended once", mock.suspendedActors)
 	}
 
-	// A repeat reconcile in the same suspended state must not revoke again.
+	// A repeat reconcile in the same suspended state revokes again; that's
+	// harmless (Revoke is idempotent) and cheaper than trying to track
+	// "already revoked" in status that a failed write could lose.
 	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
 		t.Fatal(err)
 	}
-	if len(fake.revoked) != 1 {
-		t.Fatalf("repeat suspend revoked again: %v", fake.revoked)
+	if len(fake.revoked) != 2 {
+		t.Fatalf("revoked=%v, want the repeat suspend to revoke again", fake.revoked)
 	}
 }
 

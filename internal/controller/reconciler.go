@@ -194,7 +194,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// provisioned below, and gets suspended (and its freshly minted token
 		// revoked) by the generic phase handling.
 		if suspendingExisting {
-			if err := r.suspendAndRevoke(ctx, atespace, actorName, existingActor, task, now); err != nil {
+			if err := r.suspendAndRevoke(ctx, atespace, actorName, existingActor); err != nil {
 				return r.credentialFailure(task, err.Error(), now)
 			}
 			task.Status.WorkerIp = ""
@@ -237,9 +237,6 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 				return r.credentialFailure(task, "could not mint GitHub installation token", now)
 			}
 			extraEnv["GITHUB_TOKEN"] = newToken
-			// A fresh token has not been revoked yet, whatever an earlier
-			// reconciliation of this task recorded.
-			r.setCondition(task, condCredentialRevoked, "False", "TokenMinted", "A new installation token was minted", now)
 		}
 	}
 
@@ -317,7 +314,6 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			if err := r.InstallationTokens.Revoke(ctx, newToken); err != nil {
 				return r.credentialFailure(task, fmt.Sprintf("could not revoke installation token: %v", err), now)
 			}
-			r.setCondition(task, condCredentialRevoked, "True", "Revoked", "Installation token revoked", now)
 		}
 		task.Status.WorkerIp = ""
 		task.Status.Phase = "Suspended"
@@ -417,7 +413,7 @@ DonePolling:
 	if workspaceFailed {
 		failNow := time.Now()
 		if actor, err := r.client.GetActor(ctx, atespace, actorName); err == nil {
-			if suspendErr := r.suspendAndRevoke(ctx, atespace, actorName, actor, task, failNow); suspendErr != nil {
+			if suspendErr := r.suspendAndRevoke(ctx, atespace, actorName, actor); suspendErr != nil {
 				slog.Warn("could not suspend and revoke actor after workspace failure", "actor", actorName, "error", suspendErr)
 			}
 		}
@@ -427,13 +423,9 @@ DonePolling:
 		actor, err := r.client.GetActor(ctx, atespace, actorName)
 		if err == nil && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 			// The actor is already down; only the token needs cleaning up.
-			if !r.conditionTrue(task, condCredentialRevoked) {
-				if token, tokErr := r.actorToken(ctx, actor); tokErr == nil && token != "" {
-					if revokeErr := r.InstallationTokens.Revoke(ctx, token); revokeErr != nil {
-						slog.Warn("could not revoke installation token for crashed actor", "actor", actorName, "error", revokeErr)
-					} else {
-						r.setCondition(task, condCredentialRevoked, "True", "Revoked", "Installation token revoked", time.Now())
-					}
+			if token, tokErr := r.actorToken(ctx, actor); tokErr == nil && token != "" {
+				if revokeErr := r.InstallationTokens.Revoke(ctx, token); revokeErr != nil {
+					slog.Warn("could not revoke installation token for crashed actor", "actor", actorName, "error", revokeErr)
 				}
 			}
 			return r.credentialFailure(task, "credentialed actor failed during workspace setup", time.Now())
@@ -469,11 +461,6 @@ const (
 	condReady = "Ready"
 	// condWorkspaceReady reports whether the workspace inside the actor has finished setting up.
 	condWorkspaceReady = "WorkspaceReady"
-	// condCredentialRevoked reports whether the actor's current GitHub installation
-	// token has been revoked. It is cleared whenever a fresh token is minted, so a
-	// suspend always revokes the token actually in use, and set once revocation
-	// succeeds so a repeat suspend does not try to revoke an already-void token.
-	condCredentialRevoked = "CredentialRevoked"
 )
 
 // setNotReady marks the task's Ready condition False. WorkspaceReady is left untouched:
@@ -490,27 +477,25 @@ func (r *TaskReconciler) credentialFailure(task *v1alpha1.Task, message string, 
 
 // suspendAndRevoke suspends actor on Substrate and revokes its current GitHub
 // installation token, so no credentialed actor is left running, or holding a
-// live token, once the task is no longer meant to be active. It is idempotent:
-// a repeat call on an already-suspended, already-revoked actor is a no-op.
-func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorName string, actor *ateapipb.Actor, task *v1alpha1.Task, now time.Time) error {
+// live token, once the task is no longer meant to be active. Revoke is safe to
+// call repeatedly (the GitHub API treats an already-void token as success), so
+// this always re-reads and re-revokes rather than tracking "already revoked"
+// in task status: that status can be lost (a failed or skipped status write)
+// independently of whether the actor's actual, current token was revoked.
+func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorName string, actor *ateapipb.Actor) error {
 	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
 		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
 			return fmt.Errorf("could not suspend actor: %w", err)
 		}
 	}
-	// A failed revoke leaves the actor suspended but CredentialRevoked False;
-	// retry revocation on the next reconciliation.
-	if !r.conditionTrue(task, condCredentialRevoked) {
-		token, err := r.actorToken(ctx, actor)
-		if err != nil {
-			return fmt.Errorf("could not read actor token for revocation: %w", err)
+	token, err := r.actorToken(ctx, actor)
+	if err != nil {
+		return fmt.Errorf("could not read actor token for revocation: %w", err)
+	}
+	if token != "" {
+		if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
+			return fmt.Errorf("could not revoke installation token: %w", err)
 		}
-		if token != "" {
-			if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
-				return fmt.Errorf("could not revoke installation token: %w", err)
-			}
-		}
-		r.setCondition(task, condCredentialRevoked, "True", "Revoked", "Installation token revoked", now)
 	}
 	return nil
 }

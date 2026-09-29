@@ -69,6 +69,18 @@ func (s *Server) UpdateCredentialProvider(ctx context.Context, req *v1alpha1.Upd
 		}
 		return old.GetMetadata()
 	})
+
+	atespace := p.Metadata.Atespace
+	name := p.Metadata.Name
+
+	// Acquire exclusive lock for this credential provider, so a concurrent
+	// delete can't be undone by an update racing it back into existence.
+	unlock, err := s.locker.Lock(ctx, "credentialprovider", atespace, name)
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, name, err)
+	}
+	defer unlock()
+
 	if p.ApiVersion == "" {
 		p.ApiVersion = v1alpha1.APIVersion
 	}
@@ -89,7 +101,17 @@ func (s *Server) DeleteCredentialProvider(ctx context.Context, req *v1alpha1.Del
 	if atespace == "" {
 		atespace = "default"
 	}
-	if err := s.store.DeleteCredentialProvider(ctx, atespace, req.GetName()); err != nil {
+	name := req.GetName()
+
+	// Acquire exclusive lock for this credential provider, so a concurrent
+	// update can't recreate it after this delete has already reported success.
+	unlock, err := s.locker.Lock(ctx, "credentialprovider", atespace, name)
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, name, err)
+	}
+	defer unlock()
+
+	if err := s.store.DeleteCredentialProvider(ctx, atespace, name); err != nil {
 		return nil, status.Errorf(codes.Internal, "deleting credential provider: %v", err)
 	}
 	return &v1alpha1.DeleteCredentialProviderResponse{}, nil

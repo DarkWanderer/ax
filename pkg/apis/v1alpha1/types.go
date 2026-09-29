@@ -234,8 +234,8 @@ func ValidateCredentialProvider(p *CredentialProvider) error {
 		return fmt.Errorf("spec.githubApp.permissions: at least one permission is required")
 	}
 	for name, level := range app.GetPermissions() {
-		if name == "" || (level != "read" && level != "write" && level != "admin") {
-			return fmt.Errorf("spec.githubApp.permissions: invalid permission %q=%q", name, level)
+		if name == "" || (level != "read" && level != "write") {
+			return fmt.Errorf("spec.githubApp.permissions: invalid permission %q=%q (must be \"read\" or \"write\")", name, level)
 		}
 	}
 	return nil
