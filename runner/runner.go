@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
@@ -106,12 +107,14 @@ type CommandExit struct {
 // Run executes the task-runner lifecycle and blocks until ctx is cancelled.
 //
 // Every workspace the task binds is set up in declaration order, each at its
-// own path. The task's spec.command, if any, is then started as a child process
-// in its own process group with the first workspace as its working directory
-// and AX_METADATA_URL plus spec.env in its environment. The metadata and guest
-// server keeps serving whether or not the command is still running. When ctx is
-// cancelled a running command is sent SIGTERM, given a grace period, and then
-// killed.
+// own path. Any configured workspace goals then run (concurrently with each
+// other) and are waited on. The task's spec.command, if any, is then started
+// as a child process in its own process group with the first workspace as its
+// working directory and AX_METADATA_URL plus spec.env in its environment,
+// after every goal has finished, since the command may depend on goal-driven
+// setup. The metadata and guest server keeps serving whether or not the
+// command is still running. When ctx is cancelled a running command is sent
+// SIGTERM, given a grace period, and then killed.
 //
 // Workspace setup failures are logged but do not abort the run; the task simply
 // never reports ready. Run returns an error only when the runner itself cannot
@@ -189,10 +192,14 @@ func Run(ctx context.Context, cfg Config) error {
 		slog.Info("workspace maiden run setup marked ready", "count", len(mounts))
 	}
 
-	// Goals run only once the sandbox is ready, and in the background: the agent
-	// needs the network, and Substrate's egress proxy carries traffic only for an
-	// actor its control plane considers running, which it is not until the
-	// readiness endpoint above answers. The task's own command starts meanwhile.
+	// Goals run only once the sandbox is ready: the agent needs the network,
+	// and Substrate's egress proxy carries traffic only for an actor its
+	// control plane considers running, which it is not until the readiness
+	// endpoint above answers. Each workspace's goal runs concurrently with the
+	// others, but the task's own command -- which may depend on goal-driven
+	// setup, e.g. a repository the goal itself creates -- does not start until
+	// every goal has finished.
+	var goals sync.WaitGroup
 	for i, m := range mounts {
 		if goal := m.ref.GetGoal(); ready && goal != "" {
 			if legacyGoal[i] {
@@ -200,13 +207,16 @@ func Run(ctx context.Context, cfg Config) error {
 				workspace.MarkGoalHandledByLegacySetup(m.path)
 				continue
 			}
+			goals.Add(1)
 			go func(path, goal, name string) {
+				defer goals.Done()
 				if workspace.RunGoal(ctx, path, goal) {
 					slog.Info("workspace goal completed", "workspace", name, "path", path)
 				}
 			}(m.path, goal, m.ref.GetName())
 		}
 	}
+	goals.Wait()
 
 	cmdArgs := cfg.Task.GetSpec().GetCommand()
 	if len(cmdArgs) == 0 {

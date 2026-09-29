@@ -159,6 +159,42 @@ type harness struct {
 	exited   chan runner.CommandExit
 }
 
+func TestRun_CommandWaitsForWorkspaceGoal(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	// A fake "claude" binary standing in for the goal agent: it records that
+	// the goal ran before returning, with a short sleep so a command that
+	// started too early would very likely win the race and be observed first.
+	bin := t.TempDir()
+	script := `#!/bin/sh
+sleep 0.2
+echo goal >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.task.Spec.Command = []string{"sh", "-c", "echo command >> " + events}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("events file missing: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "goal\ncommand" {
+		t.Errorf("event order = %q, want the goal to finish before the command runs", got)
+	}
+}
+
 func TestRun_TaskEnvCannotDisableGitCredentialHelper(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghs_test_secret")
 	h := newHarness(t)
