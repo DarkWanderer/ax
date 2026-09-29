@@ -524,5 +524,3 @@ func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, templateName
 	}
 	return nil
 }
-
-

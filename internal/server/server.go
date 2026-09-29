@@ -642,4 +642,3 @@ func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name str
 	}
 	return meta
 }
-
