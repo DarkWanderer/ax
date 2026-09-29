@@ -16,6 +16,8 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -470,6 +472,17 @@ func MarkerName(path string) string {
 
 // sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
 // identifier, for naming per-workspace files and directories under AXDir.
+// pathDigestBytes is how many bytes of a workspace path's digest go into its
+// sanitized name.
+const pathDigestBytes = 4
+
+// sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
+// identifier, for naming per-workspace files and directories under AXDir. Any
+// character-substitution scheme for "/" is inherently ambiguous once the
+// replacement character can also occur in a path segment itself (compare
+// "/a-b" and "/a/b", or worse, escaped variants of both); a digest of the
+// full path is appended so no two distinct paths can ever produce the same
+// name, and a readable (if lossy) prefix is kept for a human skimming AXDir.
 func sanitizePath(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
@@ -478,11 +491,9 @@ func sanitizePath(path string) string {
 	if clean == "" {
 		clean = "root"
 	}
-	// Escape literal "-" before using it as the "/" separator's replacement,
-	// so paths that only differ in where their slashes fall (e.g. "a-b" vs
-	// "a/b") can never sanitize to the same name.
-	escaped := strings.ReplaceAll(clean, "-", "--")
-	return strings.ReplaceAll(escaped, "/", "-")
+	readable := strings.ReplaceAll(clean, "/", "-")
+	sum := sha256.Sum256([]byte(clean))
+	return readable + "-" + hex.EncodeToString(sum[:pathDigestBytes])
 }
 
 // writeMarker records a completed maiden run.

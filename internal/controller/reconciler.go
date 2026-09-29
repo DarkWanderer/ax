@@ -569,7 +569,8 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 	for _, ws := range workspaces {
 		for _, repo := range ws.GetSpec().GetGit() {
 			raw := repo.GetRepo()
-			if strings.HasPrefix(raw, "git@github.com:") || strings.HasPrefix(raw, "ssh://git@github.com/") {
+			lower := strings.ToLower(raw)
+			if strings.HasPrefix(lower, "git@github.com:") || strings.HasPrefix(lower, "ssh://git@github.com/") {
 				return fmt.Errorf("credentialed GitHub repository must use HTTPS")
 			}
 			u, err := url.Parse(raw)

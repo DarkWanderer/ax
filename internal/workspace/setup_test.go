@@ -269,28 +269,40 @@ echo '3' > file.txt && git add . && git commit -m 'commit 3'
 }
 
 func TestMarkerName(t *testing.T) {
-	tests := map[string]string{
-		"/workspace":        "initialized-workspace",
-		"/workspace/":       "initialized-workspace",
-		"":                  "initialized-workspace",
-		"/":                 "initialized-root",
-		"/workspace/tools":  "initialized-workspace-tools",
-		"/workspace/a/b":    "initialized-workspace-a-b",
-		"/srv/data":         "initialized-srv-data",
-		"/workspace/tools/": "initialized-workspace-tools",
+	// Paths that normalize to the same clean form must produce the same name.
+	equivalent := [][2]string{
+		{"/workspace", "/workspace/"},
+		{"/workspace", ""},
+		{"/workspace/tools", "/workspace/tools/"},
 	}
-	for path, want := range tests {
-		if got := workspace.MarkerName(path); got != want {
-			t.Errorf("MarkerName(%q) = %q, want %q", path, got, want)
+	for _, pair := range equivalent {
+		a, b := workspace.MarkerName(pair[0]), workspace.MarkerName(pair[1])
+		if a != b {
+			t.Errorf("MarkerName(%q) = %q, MarkerName(%q) = %q, want equal", pair[0], a, pair[1], b)
+		}
+	}
+
+	// A readable prefix should still be present for a human skimming AXDir.
+	prefixes := map[string]string{
+		"/workspace":       "initialized-workspace-",
+		"/":                "initialized-root-",
+		"/workspace/tools": "initialized-workspace-tools-",
+		"/srv/data":        "initialized-srv-data-",
+	}
+	for path, prefix := range prefixes {
+		if got := workspace.MarkerName(path); !strings.HasPrefix(got, prefix) {
+			t.Errorf("MarkerName(%q) = %q, want prefix %q", path, got, prefix)
 		}
 	}
 }
 
 func TestMarkerNameCollisionResistant(t *testing.T) {
-	// These would collide under a naive "/" -> "-" substitution.
+	// These would collide under a naive "/" -> "-" substitution, or under an
+	// escape scheme that only doubles "-" before replacing "/".
 	pairs := [][2]string{
 		{"/workspace/a-b", "/workspace/a/b"},
 		{"/a--b", "/a-/b"},
+		{"/workspace/a-/b", "/workspace/a/-b"},
 	}
 	for _, pair := range pairs {
 		a, b := workspace.MarkerName(pair[0]), workspace.MarkerName(pair[1])
