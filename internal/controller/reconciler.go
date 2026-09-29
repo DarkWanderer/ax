@@ -306,6 +306,11 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	if task.Status.Phase == "Suspended" || task.Status.Phase == "" {
 		slog.Info("suspending actor on Substrate", "actor", actorName)
 		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
+			if provider != nil && newToken != "" {
+				// The actor may still be running with this token; revoking it now,
+				// and reporting the task safely suspended, would be wrong either way.
+				return r.credentialFailure(task, fmt.Sprintf("could not suspend actor: %v", err), now)
+			}
 			slog.Warn("could not suspend actor on Substrate", "error", err)
 		}
 		// A credentialed task that starts out suspended still minted a token above

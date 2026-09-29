@@ -218,6 +218,47 @@ func TestCredentialedTaskCreatedSuspendedRevokesUnusedToken(t *testing.T) {
 	}
 }
 
+// TestCredentialedCreateDoesNotRevokeOnFailedSuspend covers a fresh,
+// credentialed actor whose initial SuspendActor call fails: the actor may
+// still be running with the just-minted token, so it must not be revoked
+// (and the task must not be reported safely Suspended) until suspension is
+// confirmed to have actually happened.
+func TestCredentialedCreateDoesNotRevokeOnFailedSuspend(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{suspendActorErr: errors.New("transient substrate error")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err == nil {
+		t.Fatal("expected the failed suspend to be reported as an error")
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed", got.GetStatus().GetPhase())
+	}
+	if len(fake.revoked) != 0 {
+		t.Fatalf("revoked=%v, want no revoke while suspension is unconfirmed", fake.revoked)
+	}
+}
+
 // TestSuspendExistingActorIgnoresInvalidatedProvider covers suspending an
 // already-provisioned actor after its credential provider has been edited into
 // something that would now fail validation (e.g. a dropped repository).
@@ -371,6 +412,7 @@ type mockControlServer struct {
 	revertedActors   []string
 	createdTemplates []*ateapipb.ActorTemplate
 	actor            *ateapipb.Actor
+	suspendActorErr  error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -465,6 +507,9 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 }
 
 func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
+	if m.suspendActorErr != nil {
+		return nil, m.suspendActorErr
+	}
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
