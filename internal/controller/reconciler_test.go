@@ -160,6 +160,107 @@ func TestCredentialedTaskLifecycleAcrossWorkspaces(t *testing.T) {
 	}
 }
 
+// TestCredentialedTaskCreatedSuspendedRevokesUnusedToken covers a task created
+// with a credential provider and no explicit resume: it starts out suspended
+// (Status.Phase is unset), so its actor is created and immediately suspended
+// without ever running. The token minted for it must not be left valid.
+func TestCredentialedTaskCreatedSuspendedRevokesUnusedToken(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+	if fake.minted != 1 {
+		t.Fatalf("minted %d tokens, want 1", fake.minted)
+	}
+	if len(fake.revoked) != 1 {
+		t.Fatalf("revoked %v, want the one minted token revoked", fake.revoked)
+	}
+	if len(mock.suspendedActors) != 1 {
+		t.Fatalf("suspendedActors=%v, want the actor suspended once", mock.suspendedActors)
+	}
+
+	// A repeat reconcile in the same suspended state must not revoke again.
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.revoked) != 1 {
+		t.Fatalf("repeat suspend revoked again: %v", fake.revoked)
+	}
+}
+
+// TestSuspendExistingActorIgnoresInvalidatedProvider covers suspending an
+// already-provisioned actor after its credential provider has been edited into
+// something that would now fail validation (e.g. a dropped repository).
+// Suspending only needs the token already baked into the actor, not a fresh
+// mint or workspace access, so it must succeed regardless.
+func TestSuspendExistingActorIgnoresInvalidatedProvider(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+
+	// Create the actor first (starts suspended).
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+
+	// Edit the provider into something that would now fail ValidateCredentialProvider.
+	provider.Spec.GithubApp.Repositories = nil
+
+	task.Status.Phase = "Suspended"
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatalf("suspend failed against an invalidated provider: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+}
+
 func TestCredentialedWorkspaceFailureFailsTask(t *testing.T) {
 	ready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusFailedDependency) }))
 	defer ready.Close()
@@ -667,7 +768,7 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
-	if err := reconciler.ReconcileDelete(ctx, "default", "job"); err != nil {
+	if err := reconciler.ReconcileDelete(ctx, "default", "job", false); err != nil {
 		t.Fatalf("ReconcileDelete failed: %v", err)
 	}
 
@@ -689,6 +790,71 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 			t.Errorf("template %s should not have been deleted", keep)
 		}
 	}
+}
+
+// TestReconcileDelete_RevokesOnlyForCredentialedTasks covers a GITHUB_TOKEN
+// baked into an actor's template: it must be revoked when the deleted task
+// had a CredentialProvider, so its controller-minted token doesn't outlive
+// the task, but never touched otherwise, since a non-provider task may have
+// set GITHUB_TOKEN itself to a shared or externally managed token.
+func TestReconcileDelete_RevokesOnlyForCredentialedTasks(t *testing.T) {
+	ctx := context.Background()
+	newReconciler := func(t *testing.T) (*controller.TaskReconciler, *mockControlServer, *fakeInstallationTokens) {
+		t.Helper()
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("failed to listen: %v", err)
+		}
+		t.Cleanup(func() { lis.Close() })
+		mockSrv := &mockControlServer{
+			actor: &ateapipb.Actor{
+				Metadata:      &ateapipb.ResourceMetadata{Name: "job", Atespace: "default"},
+				ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "job-tmpl"},
+				Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+			},
+			createdTemplates: []*ateapipb.ActorTemplate{{
+				Metadata:   &ateapipb.ResourceMetadata{Name: "job-tmpl", Atespace: "default"},
+				Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "GITHUB_TOKEN", Value: "ghs_secret"}}}},
+			}},
+		}
+		grpcServer := grpc.NewServer()
+		ateapipb.RegisterControlServer(grpcServer, mockSrv)
+		go grpcServer.Serve(lis)
+		t.Cleanup(grpcServer.Stop)
+		client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("failed to create substrate client: %v", err)
+		}
+		t.Cleanup(func() { client.Close() })
+		r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+		r.SecretResolver = noSecrets
+		fake := &fakeInstallationTokens{}
+		r.InstallationTokens = fake
+		return r, mockSrv, fake
+	}
+
+	t.Run("non-provider task", func(t *testing.T) {
+		r, _, fake := newReconciler(t)
+		if err := r.ReconcileDelete(ctx, "default", "job", false); err != nil {
+			t.Fatalf("ReconcileDelete failed: %v", err)
+		}
+		if len(fake.revoked) != 0 {
+			t.Fatalf("revoked a token for a task without a credential provider: %v", fake.revoked)
+		}
+	})
+
+	t.Run("credentialed task", func(t *testing.T) {
+		r, mockSrv, fake := newReconciler(t)
+		if err := r.ReconcileDelete(ctx, "default", "job", true); err != nil {
+			t.Fatalf("ReconcileDelete failed: %v", err)
+		}
+		if len(fake.revoked) != 1 || fake.revoked[0] != "ghs_secret" {
+			t.Fatalf("revoked = %v, want the actor's token revoked", fake.revoked)
+		}
+		if len(mockSrv.deletedActors) != 1 {
+			t.Fatalf("expected the actor to still be deleted, got %v", mockSrv.deletedActors)
+		}
+	})
 }
 
 func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
@@ -729,7 +895,7 @@ func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
 	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
 	reconciler.SecretResolver = noSecrets
 
-	if err := reconciler.ReconcileDelete(ctx, "default", "slow-delete-task"); err != nil {
+	if err := reconciler.ReconcileDelete(ctx, "default", "slow-delete-task", false); err != nil {
 		t.Fatalf("ReconcileDelete failed: %v", err)
 	}
 
@@ -771,7 +937,7 @@ func TestReconcileDelete_ActorDeletionTimeout(t *testing.T) {
 	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
 	reconciler.SecretResolver = noSecrets
 
-	err = reconciler.ReconcileDelete(ctx, "default", "stuck-task")
+	err = reconciler.ReconcileDelete(ctx, "default", "stuck-task", false)
 	if err == nil {
 		t.Fatal("expected error due to timeout, got nil")
 	}

@@ -209,6 +209,9 @@ func (p *CredentialProvider) UnmarshalYAML(n *yaml.Node) error { return unmarsha
 // ValidateCredentialProvider enforces the GitHub installation token request's
 // limits before the provider can be used by a Task.
 func ValidateCredentialProvider(p *CredentialProvider) error {
+	if err := ValidateObjectMeta(p.GetMetadata()); err != nil {
+		return err
+	}
 	app := p.GetSpec().GetGithubApp()
 	if app == nil || app.GetAppId() <= 0 || app.GetInstallationId() <= 0 {
 		return fmt.Errorf("spec.githubApp: positive appId and installationId are required")

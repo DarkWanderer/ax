@@ -503,7 +503,7 @@ func runGet(serverURL, atespace string, args []string) error {
 
 		return yaml.NewEncoder(os.Stdout).Encode(m)
 	}
-	if resource == "credentialproviders" || resource == "credentialprovider" && len(args) == 1 {
+	if (resource == "credentialproviders" || resource == "credentialprovider") && len(args) == 1 {
 		resp, err := client.ListCredentialProviders(ctx, &v1alpha1.ListCredentialProvidersRequest{Atespace: atespace})
 		if err != nil {
 			return fmt.Errorf("listing credential providers: %w", err)

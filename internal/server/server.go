@@ -35,7 +35,7 @@ import (
 type Reconciler interface {
 	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
 	ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
-	ReconcileDelete(ctx context.Context, atespace, taskName string) error
+	ReconcileDelete(ctx context.Context, atespace, taskName string, hasCredentialProvider bool) error
 }
 
 // Options configures the AX API Server.
@@ -252,7 +252,7 @@ func (s *Server) DeleteTask(ctx context.Context, req *v1alpha1.DeleteTaskRequest
 
 	// Directly clean up Substrate actor and templates
 	if s.reconciler != nil {
-		if err := s.reconciler.ReconcileDelete(ctx, atespace, taskName); err != nil {
+		if err := s.reconciler.ReconcileDelete(ctx, atespace, taskName, task.GetSpec().GetCredentialProvider() != nil); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil, status.Error(codes.Canceled, err.Error())
 			}

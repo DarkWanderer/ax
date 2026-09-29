@@ -29,7 +29,7 @@ import (
 
 func TestCredentialProviderValidation(t *testing.T) {
 	valid := func() *v1alpha1.CredentialProvider {
-		return &v1alpha1.CredentialProvider{Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{
+		return &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{
 			AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"},
 			Repositories: []string{"one", "two"}, Permissions: map[string]string{"contents": "read"},
 		}}}
@@ -47,6 +47,8 @@ func TestCredentialProviderValidation(t *testing.T) {
 		}},
 		{"missing permissions", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.Permissions = nil }},
 		{"missing key", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret = nil }},
+		{"missing name", func(p *v1alpha1.CredentialProvider) { p.Metadata.Name = "" }},
+		{"invalid name", func(p *v1alpha1.CredentialProvider) { p.Metadata.Name = "Not_Valid" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := valid()

@@ -338,7 +338,7 @@ func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	return task, nil
 }
 
-func (f *fakeReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string) error {
+func (f *fakeReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string, hasCredentialProvider bool) error {
 	f.deleteCount++
 	if f.onDelete != nil {
 		return f.onDelete(ctx, atespace, taskName)

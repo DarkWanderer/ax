@@ -222,7 +222,7 @@ func (f *fakeMainReconciler) ReconcileWithProvider(ctx context.Context, task *v1
 	return task, nil
 }
 
-func (f *fakeMainReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string) error {
+func (f *fakeMainReconciler) ReconcileDelete(ctx context.Context, atespace, taskName string, hasCredentialProvider bool) error {
 	time.Sleep(100 * time.Millisecond)
 	close(f.deleted)
 	return nil
