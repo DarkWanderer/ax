@@ -407,6 +407,36 @@ func TestGoalPredatesSplit(t *testing.T) {
 	}
 }
 
+// TestGoalPredatesSplit_LegacyMarkerName covers the actual migration scenario:
+// a workspace initialized by a runner from before per-path marker names
+// included a digest has its marker at the old, undigested name, which the
+// current MarkerName no longer produces. GoalPredatesSplit must still find
+// it there and treat the workspace as pre-split.
+func TestGoalPredatesSplit_LegacyMarkerName(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+
+	legacyName := "initialized-" + strings.ReplaceAll(strings.Trim(path, "/"), "/", "-")
+	if err := os.WriteFile(filepath.Join(stateDir, legacyName), []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !workspace.GoalPredatesSplit(path) {
+		t.Fatal("a marker at the pre-digest legacy name should read as predating the split")
+	}
+
+	res, err := workspace.PrepareWorkspace(context.Background(), nil, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsMaidenRun {
+		t.Fatal("a workspace with only a legacy marker was re-run as a maiden run")
+	}
+}
+
 func TestMarkGoalHandledByLegacySetup(t *testing.T) {
 	stateDir := t.TempDir()
 	origAXDir := workspace.AXDir

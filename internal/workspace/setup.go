@@ -140,6 +140,13 @@ func prepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath st
 		slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
 		return res, nil
 	}
+	// A workspace already initialized by a runner from before per-path marker
+	// names included a digest: its marker is invisible at markerPath above, so
+	// check the pre-digest name too before treating this as a maiden run.
+	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
+		slog.Info("workspace already initialized (legacy marker); skipping maiden run setup", "path", targetPath)
+		return res, nil
+	}
 
 	slog.Info("executing workspace maiden run setup", "path", targetPath)
 	res.IsMaidenRun = true
@@ -470,8 +477,20 @@ func MarkerName(path string) string {
 	return InitializedMarkerFilename + "-" + sanitizePath(path)
 }
 
-// sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
-// identifier, for naming per-workspace files and directories under AXDir.
+// legacyMarkerName returns the marker name a runner from before per-path
+// marker names included a digest would have used for path, so a workspace it
+// already initialized is still recognized as such.
+func legacyMarkerName(path string) string {
+	if path == "" {
+		path = defaultWorkspacePath
+	}
+	clean := strings.Trim(filepath.Clean(path), "/")
+	if clean == "" {
+		clean = "root"
+	}
+	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
+}
+
 // pathDigestBytes is how many bytes of a workspace path's digest go into its
 // sanitized name.
 const pathDigestBytes = 4
@@ -520,6 +539,12 @@ func GoalPredatesSplit(targetPath string) bool {
 	}
 	if abs, err := filepath.Abs(targetPath); err == nil {
 		targetPath = abs
+	}
+	// A marker at the pre-digest legacy name can only have been written by a
+	// runner that predates this whole marker-naming scheme, and so predates
+	// the goal split too, regardless of its content.
+	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
+		return true
 	}
 	data, err := os.ReadFile(filepath.Join(AXDir, MarkerName(targetPath)))
 	if err != nil {
