@@ -225,6 +225,17 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	if provider != nil {
 		state := existingActor.GetStatus().GetState()
 		if existingActor == nil || (state != ateapipb.ActorState_ACTOR_STATE_RUNNING && state != ateapipb.ActorState_ACTOR_STATE_RESUMING) {
+			// Rotating a suspended (or crashed) actor's token: revoke whatever it
+			// still holds first, so a resume never leaves two live tokens behind.
+			if existingActor != nil {
+				if oldToken, err := r.actorToken(ctx, existingActor); err != nil {
+					return r.credentialFailure(task, fmt.Sprintf("could not read previous installation token: %v", err), now)
+				} else if oldToken != "" {
+					if err := r.InstallationTokens.Revoke(ctx, oldToken); err != nil {
+						return r.credentialFailure(task, fmt.Sprintf("could not revoke previous installation token: %v", err), now)
+					}
+				}
+			}
 			keyRef := provider.GetSpec().GetGithubApp().GetPrivateKeySecret()
 			secretCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
 			privateKey, err := r.SecretResolver(secretCtx, atespace, keyRef.GetName(), keyRef.GetKey())

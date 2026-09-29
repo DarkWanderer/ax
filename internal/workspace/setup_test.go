@@ -350,6 +350,55 @@ func TestRunGoalClaudeWithoutAnthropicKeyDoesNotUseGemini(t *testing.T) {
 	}
 }
 
+func TestGoalPredatesSplit(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+
+	if workspace.GoalPredatesSplit(path) {
+		t.Fatal("no marker at all should not read as predating the split")
+	}
+
+	// A marker written by a pre-split runner: no goal_tracking line.
+	legacyMarker := filepath.Join(stateDir, workspace.MarkerName(path))
+	if err := os.WriteFile(legacyMarker, []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !workspace.GoalPredatesSplit(path) {
+		t.Fatal("a marker without the split sentinel should read as predating the split")
+	}
+
+	// A marker written by this runner (via a real maiden-run setup) carries
+	// the sentinel and must not be flagged.
+	freshPath := filepath.Join(t.TempDir(), "ws2")
+	if _, err := workspace.PrepareWorkspace(context.Background(), nil, freshPath); err != nil {
+		t.Fatal(err)
+	}
+	if workspace.GoalPredatesSplit(freshPath) {
+		t.Fatal("a marker written by this runner should not read as predating the split")
+	}
+}
+
+func TestMarkGoalHandledByLegacySetup(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+
+	workspace.MarkGoalHandledByLegacySetup(path)
+
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); err != nil {
+		t.Fatalf("goal marker missing after MarkGoalHandledByLegacySetup: %v", err)
+	}
+	// RunGoal must now treat the goal as already done and not run it again.
+	if workspace.RunGoal(context.Background(), path, "some goal") {
+		t.Fatal("RunGoal re-ran a goal already marked handled by legacy setup")
+	}
+}
+
 func TestRunGoalClaudePassesPromptOnStdin(t *testing.T) {
 	t.Setenv("AX_GOAL_AGENT", "claude")
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")

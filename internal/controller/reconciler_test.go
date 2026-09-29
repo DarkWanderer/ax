@@ -38,6 +38,7 @@ type fakeInstallationTokens struct {
 	minted       int
 	revoked      []string
 	repositories []string
+	revokeFails  int // the next N Revoke calls return an error instead of succeeding
 }
 
 func (f *fakeInstallationTokens) Mint(_ context.Context, app *v1alpha1.GitHubAppCredential, _ string) (string, error) {
@@ -46,6 +47,10 @@ func (f *fakeInstallationTokens) Mint(_ context.Context, app *v1alpha1.GitHubApp
 	return "ghs_test_token_" + string(rune('0'+f.minted)), nil
 }
 func (f *fakeInstallationTokens) Revoke(_ context.Context, token string) error {
+	if f.revokeFails > 0 {
+		f.revokeFails--
+		return errors.New("transient revoke error")
+	}
 	f.revoked = append(f.revoked, token)
 	return nil
 }
@@ -259,6 +264,65 @@ func TestCredentialedCreateDoesNotRevokeOnFailedSuspend(t *testing.T) {
 	}
 }
 
+// TestResumeRevokesStaleTokenFromFailedSuspend covers a suspend that reaches
+// Substrate (the actor really is SUSPENDED) but whose token revoke fails
+// transiently. A later resume must revoke that stale, still-live token before
+// minting its replacement: GitHub allows multiple concurrent installation
+// tokens, so simply minting a new one would leave the old one valid until its
+// own expiry.
+func TestResumeRevokesStaleTokenFromFailedSuspend(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	// Resume once so the actor is running with a live token, then suspend it:
+	// the actor genuinely reaches SUSPENDED, but the revoke fails.
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+	fake.revokeFails = 1
+	task.Status.Phase = "Suspended"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err == nil {
+		t.Fatal("expected the failed revoke to be reported as an error")
+	}
+	if len(mock.suspendedActors) != 1 {
+		t.Fatalf("suspendedActors=%v, want the actor actually suspended despite the revoke failure", mock.suspendedActors)
+	}
+	if len(fake.revoked) != 0 {
+		t.Fatalf("revoked=%v, want none recorded after a failed revoke", fake.revoked)
+	}
+
+	// Resume: must revoke the still-live token from the failed suspend before
+	// minting the replacement.
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 2 || len(fake.revoked) != 1 || fake.revoked[0] != "ghs_test_token_1" {
+		t.Fatalf("minted=%d revoked=%v, want the stale first token revoked before minting the second", fake.minted, fake.revoked)
+	}
+}
+
 // TestSuspendExistingActorIgnoresInvalidatedProvider covers suspending an
 // already-provisioned actor after its credential provider has been edited into
 // something that would now fail validation (e.g. a dropped repository).
@@ -345,7 +409,10 @@ func TestSuspendExistingActorWithDeletedProvider(t *testing.T) {
 	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
 		t.Fatal(err)
 	}
-	if fake.minted != 2 || len(fake.revoked) != 1 {
+	// minted=2: the initial suspended create, then the resume's rotation.
+	// revoked=2: the create-suspend's own token, then the old token revoked
+	// just before the resume minted its replacement.
+	if fake.minted != 2 || len(fake.revoked) != 2 {
 		t.Fatalf("minted=%d revoked=%v before deletion scenario", fake.minted, fake.revoked)
 	}
 
@@ -358,7 +425,7 @@ func TestSuspendExistingActorWithDeletedProvider(t *testing.T) {
 	if got.GetStatus().GetPhase() != "Suspended" {
 		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
 	}
-	if len(fake.revoked) != 2 {
+	if len(fake.revoked) != 3 {
 		t.Fatalf("revoked=%v, want the actor's live token revoked despite the deleted provider", fake.revoked)
 	}
 }

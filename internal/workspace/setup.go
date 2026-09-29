@@ -37,6 +37,11 @@ const (
 	// recording that its goal was carried out. The goal is tracked separately
 	// because it runs after the workspace is otherwise prepared.
 	goalMarkerSuffix = ".goal"
+	// goalSplitSentinel appears in a marker written by this split-goal runner.
+	// Its absence from an existing marker means the marker predates the split,
+	// from a runner whose SetupWorkspace ran the goal inline before writing it
+	// -- so for that workspace, a configured goal already ran once.
+	goalSplitSentinel = "goal_tracking: split\n"
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -193,6 +198,24 @@ func RunGoal(ctx context.Context, targetPath, goal string) bool {
 		slog.Warn("failed to write goal marker file", "path", markerPath, "error", err)
 	}
 	return true
+}
+
+// MarkGoalHandledByLegacySetup records a workspace's goal as already carried
+// out without running it, for a workspace whose GoalPredatesSplit is true: its
+// goal already ran once, inline, under a pre-split runner. Callers use this in
+// place of RunGoal for that one workspace, on this one boot.
+func MarkGoalHandledByLegacySetup(targetPath string) {
+	if targetPath == "" {
+		targetPath = defaultWorkspacePath
+	}
+	if abs, err := filepath.Abs(targetPath); err == nil {
+		targetPath = abs
+	}
+	markerPath := filepath.Join(AXDir, MarkerName(targetPath)+goalMarkerSuffix)
+	content := fmt.Sprintf("goal: (ran by a pre-split runner)\ncompleted_at: %s\n", time.Now().UTC().Format(time.RFC3339))
+	if err := os.WriteFile(markerPath, []byte(content), filePerm); err != nil {
+		slog.Warn("failed to write goal marker file for legacy setup", "path", markerPath, "error", err)
+	}
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
@@ -455,10 +478,30 @@ func writeMarker(path string, ws *v1alpha1.Workspace) {
 	if ws != nil && ws.GetMetadata() != nil && ws.GetMetadata().GetName() != "" {
 		name = ws.GetMetadata().GetName()
 	}
-	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
+	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n%s", name, time.Now().UTC().Format(time.RFC3339), goalSplitSentinel)
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		slog.Warn("failed to write initialized marker file", "path", path, "error", err)
 	}
+}
+
+// GoalPredatesSplit reports whether a workspace's maiden-run marker exists and
+// was written by a runner from before goal execution was split out of setup
+// (see RunGoal). For such a workspace, a configured goal already ran once, as
+// part of that earlier, monolithic setup, and must not be run again by RunGoal
+// under this runner. A workspace with no marker yet, or one already using the
+// current split-goal marker format, returns false.
+func GoalPredatesSplit(targetPath string) bool {
+	if targetPath == "" {
+		targetPath = defaultWorkspacePath
+	}
+	if abs, err := filepath.Abs(targetPath); err == nil {
+		targetPath = abs
+	}
+	data, err := os.ReadFile(filepath.Join(AXDir, MarkerName(targetPath)))
+	if err != nil {
+		return false
+	}
+	return !strings.Contains(string(data), goalSplitSentinel)
 }
 
 // writeStateFile writes a diagnostic file under AXDir, logging rather than failing on error.

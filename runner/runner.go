@@ -155,6 +155,17 @@ func Run(ctx context.Context, cfg Config) error {
 		_ = metaServer.Stop(context.Background())
 	}()
 
+	// A workspace already initialized by a runner from before goal execution
+	// was split out of setup (see workspace.GoalPredatesSplit) already ran its
+	// goal, inline, as part of that earlier setup. Check before PrepareWorkspace
+	// runs below, since a maiden run writes the current-format marker that
+	// would make the workspace indistinguishable from one split-goal already
+	// handled.
+	legacyGoal := make([]bool, len(mounts))
+	for i, m := range mounts {
+		legacyGoal[i] = workspace.GoalPredatesSplit(m.path)
+	}
+
 	ready := true
 	for _, m := range mounts {
 		var err error
@@ -182,8 +193,13 @@ func Run(ctx context.Context, cfg Config) error {
 	// needs the network, and Substrate's egress proxy carries traffic only for an
 	// actor its control plane considers running, which it is not until the
 	// readiness endpoint above answers. The task's own command starts meanwhile.
-	for _, m := range mounts {
+	for i, m := range mounts {
 		if goal := m.ref.GetGoal(); ready && goal != "" {
+			if legacyGoal[i] {
+				slog.Info("workspace goal already carried out by a pre-split runner; not repeating it", "workspace", m.ref.GetName(), "path", m.path)
+				workspace.MarkGoalHandledByLegacySetup(m.path)
+				continue
+			}
 			go func(path, goal, name string) {
 				if workspace.RunGoal(ctx, path, goal) {
 					slog.Info("workspace goal completed", "workspace", name, "path", path)
