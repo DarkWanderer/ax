@@ -382,7 +382,10 @@ func runBootstrap(ctx context.Context, goal, targetPath string) (ran bool, retry
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	dataDir := filepath.Join(AXDir, bootstrapDataDir)
+	// Scoped per workspace: goals for different workspaces run concurrently
+	// (see runner.Run), and the Antigravity agent uses this directory for its
+	// own session/cache state, which a shared directory would race on.
+	dataDir := filepath.Join(AXDir, bootstrapDataDir, sanitizePath(targetPath))
 	if err := os.MkdirAll(dataDir, dirPerm); err != nil {
 		slog.Warn("creating Antigravity data dir", "dir", dataDir, "error", err)
 	}
@@ -462,6 +465,12 @@ func bootstrapTimeout() time.Duration {
 // path. The name is derived from the path so several workspaces in one
 // container track their setup independently.
 func MarkerName(path string) string {
+	return InitializedMarkerFilename + "-" + sanitizePath(path)
+}
+
+// sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
+// identifier, for naming per-workspace files and directories under AXDir.
+func sanitizePath(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
 	}
@@ -469,7 +478,7 @@ func MarkerName(path string) string {
 	if clean == "" {
 		clean = "root"
 	}
-	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
+	return strings.ReplaceAll(clean, "/", "-")
 }
 
 // writeMarker records a completed maiden run.

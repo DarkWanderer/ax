@@ -61,6 +61,12 @@ const (
 	// resumed actor to finish workspace setup.
 	defaultWorkspaceReadyTimeout = 15 * time.Second
 	workspaceReadyPollInterval   = 500 * time.Millisecond
+	// cleanupRevokeTimeout bounds a compensating token revoke after some other
+	// step failed. It deliberately does not reuse ctx: ctx may be the reason
+	// the other step failed (canceled, deadline exceeded), and revoking the
+	// only copy of a freshly minted token must not be skipped just because the
+	// caller's context is now dead.
+	cleanupRevokeTimeout = 5 * time.Second
 )
 
 // SecretResolver looks up a key from a Kubernetes secret in the given namespace.
@@ -269,6 +275,24 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	// must not create new golden snapshots.
 	launchTask := proto.Clone(task).(*v1alpha1.Task)
 	launchTask.Status = nil
+	// The runner re-applies every AX_TASK_YAML spec.env entry over the
+	// container's real environment on startup (see runner.Run), which would
+	// otherwise stomp the credentials just resolved above -- e.g. restoring a
+	// task-supplied ANTHROPIC_API_KEY that was deliberately cleared for
+	// OpenRouter, or an ANTHROPIC_AUTH_TOKEN the task itself happened to set.
+	// Strip anything the controller manages so only its resolved value reaches
+	// the container.
+	if launchTask.Spec != nil && len(launchTask.Spec.Env) > 0 {
+		kept := launchTask.Spec.Env[:0]
+		for _, e := range launchTask.Spec.Env {
+			switch e.GetName() {
+			case anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey:
+			default:
+				kept = append(kept, e)
+			}
+		}
+		launchTask.Spec.Env = kept
+	}
 	if taskYAML, err := yaml.Marshal(launchTask); err == nil {
 		extraEnv["AX_TASK_YAML"] = string(taskYAML)
 	}
@@ -285,7 +309,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 
 		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
 		if err != nil && provider != nil {
-			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			r.revokeForCleanup(newToken)
 			return r.credentialFailure(task, "could not create credentialed actor template", now)
 		} else if err != nil {
 			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
@@ -297,7 +321,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	}
 	if provider != nil && existingActor != nil && newToken != "" && (existingActor.GetActorTemplate().GetName() != templateName || existingActor.GetActorTemplate().GetAtespace() != templateAtespace) {
 		if _, err := r.client.SetActorTemplate(ctx, existingActor, templateAtespace, templateName); err != nil {
-			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			r.revokeForCleanup(newToken)
 			return r.credentialFailure(task, "could not switch actor template", now)
 		}
 	}
@@ -305,7 +329,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
 	if err != nil {
 		if newToken != "" {
-			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			r.revokeForCleanup(newToken)
 		}
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -343,7 +367,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
 		if newToken != "" {
-			_ = r.InstallationTokens.Revoke(ctx, newToken)
+			r.revokeForCleanup(newToken)
 		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -440,9 +464,7 @@ DonePolling:
 		if err == nil && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 			// The actor is already down; only the token needs cleaning up.
 			if token, tokErr := r.actorToken(ctx, actor); tokErr == nil && token != "" {
-				if revokeErr := r.InstallationTokens.Revoke(ctx, token); revokeErr != nil {
-					slog.Warn("could not revoke installation token for crashed actor", "actor", actorName, "error", revokeErr)
-				}
+				r.revokeForCleanup(token)
 			}
 			return r.credentialFailure(task, "credentialed actor failed during workspace setup", time.Now())
 		}
@@ -491,6 +513,18 @@ func (r *TaskReconciler) credentialFailure(task *v1alpha1.Task, message string, 
 	return task, errors.New(message)
 }
 
+// revokeForCleanup revokes a token minted earlier in a Reconcile call that
+// then failed a later step, using a fresh context instead of the caller's:
+// that context may itself be why the later step failed (canceled or expired),
+// and the only copy of the token must still be revoked.
+func (r *TaskReconciler) revokeForCleanup(token string) {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+	defer cancel()
+	if err := r.InstallationTokens.Revoke(cleanupCtx, token); err != nil {
+		slog.Warn("could not revoke installation token during cleanup", "error", err)
+	}
+}
+
 // suspendAndRevoke suspends actor on Substrate and revokes its current GitHub
 // installation token, so no credentialed actor is left running, or holding a
 // live token, once the task is no longer meant to be active. Revoke is safe to
@@ -509,7 +543,12 @@ func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorNa
 		return fmt.Errorf("could not read actor token for revocation: %w", err)
 	}
 	if token != "" {
-		if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
+		// A fresh context: this can run after ctx has been waiting on a poll
+		// loop or another failed step, and revocation must not be skipped just
+		// because ctx is now canceled or past its deadline.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+		defer cancel()
+		if err := r.InstallationTokens.Revoke(cleanupCtx, token); err != nil {
 			return fmt.Errorf("could not revoke installation token: %w", err)
 		}
 	}

@@ -1253,3 +1253,62 @@ func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
 		t.Error("Anthropic API key must be explicitly empty for OpenRouter")
 	}
 }
+
+// TestOpenRouterCredentialSurvivesTaskSuppliedEnv covers a task whose own
+// spec.env happens to set ANTHROPIC_API_KEY: the runner re-applies every
+// AX_TASK_YAML spec.env entry over the container's real environment at
+// startup, so if that stale key stayed in AX_TASK_YAML it would silently
+// override the OpenRouter credentials just resolved for the container.
+func TestOpenRouterCredentialSurvivesTaskSuppliedEnv(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	reconciler.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return "test-openrouter-key", nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "openrouter-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env: []*v1alpha1.EnvVar{
+				{Name: "AX_GOAL_AGENT", Value: "claude"},
+				{Name: "AX_CLAUDE_PROVIDER", Value: "openrouter"},
+				{Name: "ANTHROPIC_API_KEY", Value: "stale-task-supplied-key"},
+			},
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+	var taskYAML string
+	env := map[string]string{}
+	for _, v := range mockSrv.createdTemplates[0].Containers[0].Env {
+		env[v.Name] = v.Value
+		if v.Name == "AX_TASK_YAML" {
+			taskYAML = v.Value
+		}
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "test-openrouter-key" {
+		t.Error("OpenRouter token missing from container environment")
+	}
+	if strings.Contains(taskYAML, "stale-task-supplied-key") || strings.Contains(taskYAML, "ANTHROPIC_API_KEY") {
+		t.Errorf("AX_TASK_YAML still carries the task-supplied ANTHROPIC_API_KEY, which the runner would reapply over the container env: %s", taskYAML)
+	}
+}
