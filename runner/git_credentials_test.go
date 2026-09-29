@@ -27,7 +27,7 @@ func TestGitCredentialHelperUsesEnvironmentOnlyForGitHub(t *testing.T) {
 	for _, tc := range []struct {
 		host string
 		want bool
-	}{{"github.com", true}, {"GitHub.com", true}, {"example.com", false}} {
+	}{{"github.com", true}, {"GitHub.com", true}, {"github.com:443", true}, {"example.com", false}} {
 		cmd := exec.Command("git", "credential", "fill")
 		cmd.Env = os.Environ()
 		cmd.Stdin = strings.NewReader("protocol=https\nhost=" + tc.host + "\n\n")

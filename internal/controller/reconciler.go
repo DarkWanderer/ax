@@ -319,14 +319,14 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
 		}
 	}
-	if provider != nil && existingActor != nil && newToken != "" && (existingActor.GetActorTemplate().GetName() != templateName || existingActor.GetActorTemplate().GetAtespace() != templateAtespace) {
-		if _, err := r.client.SetActorTemplate(ctx, existingActor, templateAtespace, templateName); err != nil {
-			r.revokeForCleanup(newToken)
-			return r.credentialFailure(task, "could not switch actor template", now)
-		}
-	}
-
-	_, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
+	// A crashed actor is only reverted to SUSPENDED by EnsureActor below (via
+	// its own AlreadyExists/RevertActor recovery), and SetActorTemplate needs
+	// a suspended actor -- so the template switch has to happen after
+	// EnsureActor, against whatever actor it actually returns, not the
+	// pre-call existingActor. For an actor that was already suspended (not
+	// crashed), EnsureActor returns that same actor, so this is equivalent to
+	// switching before it in every other case.
+	ensuredActor, err := r.client.EnsureActor(ctx, atespace, actorName, templateAtespace, templateName)
 	if err != nil {
 		if newToken != "" {
 			r.revokeForCleanup(newToken)
@@ -334,6 +334,12 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
+	}
+	if provider != nil && newToken != "" && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
+		if _, err := r.client.SetActorTemplate(ctx, ensuredActor, templateAtespace, templateName); err != nil {
+			r.revokeForCleanup(newToken)
+			return r.credentialFailure(task, "could not switch actor template", now)
+		}
 	}
 
 	// 4. Suspend or Resume the Actor

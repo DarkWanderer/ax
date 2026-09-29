@@ -478,7 +478,11 @@ func sanitizePath(path string) string {
 	if clean == "" {
 		clean = "root"
 	}
-	return strings.ReplaceAll(clean, "/", "-")
+	// Escape literal "-" before using it as the "/" separator's replacement,
+	// so paths that only differ in where their slashes fall (e.g. "a-b" vs
+	// "a/b") can never sanitize to the same name.
+	escaped := strings.ReplaceAll(clean, "-", "--")
+	return strings.ReplaceAll(escaped, "/", "-")
 }
 
 // writeMarker records a completed maiden run.

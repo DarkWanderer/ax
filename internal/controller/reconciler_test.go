@@ -1150,6 +1150,50 @@ func TestEnsureActor_RevertsCrashedActor(t *testing.T) {
 	}
 }
 
+// TestCredentialedResumeSwitchesTemplateAfterCrashRevert covers a credentialed
+// actor found CRASHED on resume: SetActorTemplate only works on a suspended
+// actor, and only EnsureActor's own crash recovery (RevertActor) gets it
+// there, so the token-bearing template switch must happen after EnsureActor,
+// against the actor it actually returns -- not be attempted first against the
+// still-crashed actor, which would reject it and strand the task.
+func TestCredentialedResumeSwitchesTemplateAfterCrashRevert(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{crashedActor: "job"}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Phase: "Running", Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatalf("resume after crash failed: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running", got.GetStatus().GetPhase())
+	}
+	if len(mockSrv.revertedActors) != 1 {
+		t.Fatalf("revertedActors=%v, want the crashed actor reverted once", mockSrv.revertedActors)
+	}
+	if mockSrv.actor.GetActorTemplate().GetName() == "" {
+		t.Fatal("reverted actor never had its template switched to the credentialed one")
+	}
+}
+
 func TestTaskReconcilerClaudeCredential(t *testing.T) {
 	t.Setenv("GEMINI_API_KEY", "gemini-must-not-be-injected")
 	lis, err := net.Listen("tcp", "127.0.0.1:0")

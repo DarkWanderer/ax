@@ -24,5 +24,5 @@ func configureGitCredentials() {
 	_ = os.Setenv("GIT_CONFIG_KEY_0", "credential.helper")
 	_ = os.Setenv("GIT_CONFIG_VALUE_0", "")
 	_ = os.Setenv("GIT_CONFIG_KEY_1", "credential.https://github.com.helper")
-	_ = os.Setenv("GIT_CONFIG_VALUE_1", `!f() { [ "$1" = get ] || exit 0; protocol=; host=; while IFS= read -r line; do case "$line" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]'); if [ "$protocol" = https ] && [ "$host" = github.com ] && [ -n "$GITHUB_TOKEN" ]; then printf 'username=x-access-token\npassword=%s\n' "$GITHUB_TOKEN"; fi; }; f`)
+	_ = os.Setenv("GIT_CONFIG_VALUE_1", `!f() { [ "$1" = get ] || exit 0; protocol=; host=; while IFS= read -r line; do case "$line" in protocol=*) protocol=${line#protocol=} ;; host=*) host=${line#host=} ;; esac; done; host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]'); host=${host%:443}; if [ "$protocol" = https ] && [ "$host" = github.com ] && [ -n "$GITHUB_TOKEN" ]; then printf 'username=x-access-token\npassword=%s\n' "$GITHUB_TOKEN"; fi; }; f`)
 }

@@ -286,6 +286,20 @@ func TestMarkerName(t *testing.T) {
 	}
 }
 
+func TestMarkerNameCollisionResistant(t *testing.T) {
+	// These would collide under a naive "/" -> "-" substitution.
+	pairs := [][2]string{
+		{"/workspace/a-b", "/workspace/a/b"},
+		{"/a--b", "/a-/b"},
+	}
+	for _, pair := range pairs {
+		a, b := workspace.MarkerName(pair[0]), workspace.MarkerName(pair[1])
+		if a == b {
+			t.Errorf("MarkerName(%q) and MarkerName(%q) collide: both %q", pair[0], pair[1], a)
+		}
+	}
+}
+
 func TestSetupWorkspace_InlinedFiles(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "ax-ws-files-*")
 	if err != nil {
