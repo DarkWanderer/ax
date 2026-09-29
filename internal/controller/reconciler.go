@@ -373,6 +373,17 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	_, workerIP, err := r.client.ResumeActor(ctx, atespace, actorName)
 	if err != nil {
 		if newToken != "" {
+			// ResumeActor's error is ambiguous: Substrate may have resumed the
+			// actor anyway and only the response was lost, in which case it is
+			// now running with newToken baked into its template. Revoking that
+			// token without also suspending would leave a running actor with a
+			// dead credential, and the next ResumeTask would see it already
+			// RUNNING and skip rotating the token, so it would never recover.
+			// Force it back to SUSPENDED first (a no-op if it never actually
+			// resumed) so the next attempt mints and applies a fresh token.
+			if suspendErr := r.client.SuspendActor(ctx, atespace, actorName); suspendErr != nil {
+				slog.Warn("could not suspend actor after ambiguous resume failure", "actor", actorName, "error", suspendErr)
+			}
 			r.revokeForCleanup(newToken)
 		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)

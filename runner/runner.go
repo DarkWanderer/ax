@@ -281,10 +281,20 @@ func reportExit(cfg Config, cmd *exec.Cmd, err error) {
 
 // commandEnv builds the environment for the task command: the runner's own
 // environment, the metadata URL, and the Task's spec.env entries.
+//
+// The Task's spec.env is appended last so it can override the runner's own
+// environment as intended, except for the Git credential helper: os/exec
+// keeps the last value of a duplicate key, so a task-supplied
+// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_*/GIT_CONFIG_VALUE_*/GIT_TERMINAL_PROMPT
+// would otherwise silently disable or redirect it. Re-apply those exact
+// entries after spec.env so the helper always wins for the command too.
 func commandEnv(task *v1alpha1.Task, port int) []string {
 	env := append(os.Environ(), fmt.Sprintf("AX_METADATA_URL=http://127.0.0.1:%d", port))
 	for _, e := range task.GetSpec().GetEnv() {
 		env = append(env, fmt.Sprintf("%s=%s", e.GetName(), e.GetValue()))
+	}
+	if os.Getenv("GITHUB_TOKEN") != "" {
+		env = append(env, gitCredentialEnv...)
 	}
 	return env
 }

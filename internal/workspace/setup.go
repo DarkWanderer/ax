@@ -44,6 +44,10 @@ const (
 	// from a runner whose SetupWorkspace ran the goal inline before writing it
 	// -- so for that workspace, a configured goal already ran once.
 	goalSplitSentinel = "goal_tracking: split\n"
+	// goalMarkerWriteAttempts and goalMarkerWriteRetryDelay bound how hard
+	// RunGoal retries persisting its completion marker before giving up.
+	goalMarkerWriteAttempts   = 3
+	goalMarkerWriteRetryDelay = 500 * time.Millisecond
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -202,9 +206,22 @@ func RunGoal(ctx context.Context, targetPath, goal string) bool {
 		return false
 	}
 
-	if err := os.WriteFile(markerPath, []byte(fmt.Sprintf("goal: %s\ncompleted_at: %s\n",
-		goal, time.Now().UTC().Format(time.RFC3339))), filePerm); err != nil {
-		slog.Warn("failed to write goal marker file", "path", markerPath, "error", err)
+	content := []byte(fmt.Sprintf("goal: %s\ncompleted_at: %s\n", goal, time.Now().UTC().Format(time.RFC3339)))
+	// The goal itself already ran, including any non-idempotent side effects;
+	// without this marker the next actor boot cannot tell and repeats it.
+	// Retry past a transient write failure rather than accepting that risk
+	// on the first error.
+	var err error
+	for attempt := range goalMarkerWriteAttempts {
+		if attempt > 0 {
+			time.Sleep(goalMarkerWriteRetryDelay)
+		}
+		if err = os.WriteFile(markerPath, content, filePerm); err == nil {
+			break
+		}
+	}
+	if err != nil {
+		slog.Error("failed to write goal marker file after retrying; goal will be repeated on next boot", "path", markerPath, "error", err)
 	}
 	return true
 }
@@ -491,10 +508,6 @@ func legacyMarkerName(path string) string {
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
 }
 
-// pathDigestBytes is how many bytes of a workspace path's digest go into its
-// sanitized name.
-const pathDigestBytes = 4
-
 // sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
 // identifier, for naming per-workspace files and directories under AXDir. Any
 // character-substitution scheme for "/" is inherently ambiguous once the
@@ -502,6 +515,9 @@ const pathDigestBytes = 4
 // "/a-b" and "/a/b", or worse, escaped variants of both); a digest of the
 // full path is appended so no two distinct paths can ever produce the same
 // name, and a readable (if lossy) prefix is kept for a human skimming AXDir.
+// The full digest is kept, not truncated: workspace paths can come from task
+// specs, so a short digest lets a crafted path be brute-forced into
+// colliding with another workspace's marker.
 func sanitizePath(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
@@ -512,7 +528,7 @@ func sanitizePath(path string) string {
 	}
 	readable := strings.ReplaceAll(clean, "/", "-")
 	sum := sha256.Sum256([]byte(clean))
-	return readable + "-" + hex.EncodeToString(sum[:pathDigestBytes])
+	return readable + "-" + hex.EncodeToString(sum[:])
 }
 
 // writeMarker records a completed maiden run.

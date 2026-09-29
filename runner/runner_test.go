@@ -159,6 +159,33 @@ type harness struct {
 	exited   chan runner.CommandExit
 }
 
+func TestRun_TaskEnvCannotDisableGitCredentialHelper(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "ghs_test_secret")
+	h := newHarness(t)
+	outFile := filepath.Join(t.TempDir(), "out.txt")
+	// A task spec.env that happens to (or is crafted to) set these would, without
+	// the fix, silently override the controller-managed credential helper for
+	// the command process since os/exec keeps the last duplicate env value.
+	h.task.Spec.Env = []*v1alpha1.EnvVar{
+		{Name: "GITHUB_TOKEN", Value: "ghs_test_secret"},
+		{Name: "GIT_CONFIG_COUNT", Value: "0"},
+	}
+	h.task.Spec.Command = []string{"sh", "-c", `echo "$GIT_CONFIG_COUNT" > ` + outFile}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("command did not write its output: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "2" {
+		t.Errorf("GIT_CONFIG_COUNT in command env = %q, want the helper's own value (2), task env must not override it", got)
+	}
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	dir := t.TempDir()

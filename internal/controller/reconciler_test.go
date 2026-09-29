@@ -323,6 +323,69 @@ func TestResumeRevokesStaleTokenFromFailedSuspend(t *testing.T) {
 	}
 }
 
+// TestAmbiguousResumeFailureSuspendsActorBeforeRevoking covers a ResumeActor
+// call whose response is lost even though Substrate actually resumed the
+// actor: the reconciler must force the actor back to SUSPENDED (not merely
+// revoke the now-dead token it was left running with), so a subsequent
+// resume attempt sees SUSPENDED and mints and applies a fresh token, instead
+// of seeing RUNNING and skipping rotation forever.
+func TestAmbiguousResumeFailureSuspendsActorBeforeRevoking(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{resumeActorErr: errors.New("deadline exceeded")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	// Create the actor (starts suspended), then attempt to resume it: the
+	// mock flips it to RUNNING server-side but still reports an error.
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err == nil {
+		t.Fatal("expected the ambiguous resume failure to be reported as an error")
+	}
+	if len(mock.suspendedActors) != 1 {
+		t.Fatalf("suspendedActors=%v, want the actor forced back to SUSPENDED after the ambiguous resume failure", mock.suspendedActors)
+	}
+	if len(fake.revoked) != 1 || fake.revoked[0] != "ghs_test_token_1" {
+		t.Fatalf("revoked=%v, want the token left on the actor revoked", fake.revoked)
+	}
+
+	// Retry the resume, now that Substrate genuinely resumes: it must rotate
+	// to a fresh token rather than reusing the revoked one.
+	mock.resumeActorErr = nil
+	task.Status.Phase = "Suspended"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatalf("re-suspend failed: %v", err)
+	}
+	task.Status.Phase = "Running"
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatalf("retry after ambiguous resume failure: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running", got.GetStatus().GetPhase())
+	}
+	if fake.minted != 2 {
+		t.Fatalf("minted=%d, want a fresh token minted on the successful retry", fake.minted)
+	}
+}
+
 // TestSuspendExistingActorIgnoresInvalidatedProvider covers suspending an
 // already-provisioned actor after its credential provider has been edited into
 // something that would now fail validation (e.g. a dropped repository).
@@ -514,6 +577,11 @@ type mockControlServer struct {
 	createdTemplates []*ateapipb.ActorTemplate
 	actor            *ateapipb.Actor
 	suspendActorErr  error
+	// resumeActorErr, when set, is returned to the caller of ResumeActor to
+	// simulate an ambiguous failure: the actor is still flipped to RUNNING
+	// server-side (as a real Substrate resume that actually succeeded would
+	// leave it), but the client never sees that success.
+	resumeActorErr error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -587,6 +655,9 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 	m.resumedActors = append(m.resumedActors, name)
 	if m.actor != nil {
 		m.actor.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
+	}
+	if m.resumeActorErr != nil {
+		return nil, m.resumeActorErr
 	}
 	wIP := "10.244.1.42"
 	if m.workerIP != "" {
