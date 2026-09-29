@@ -398,7 +398,10 @@ func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1a
 
 // fetchCredentialProvider resolves the CredentialProvider a task's spec
 // references, so the reconciler can mint a fresh installation token for it.
-// A task without spec.credentialProvider gets a nil provider.
+// A task without spec.credentialProvider gets a nil provider, and so does one
+// whose provider was deleted or is otherwise not found: the reconciler still
+// needs to be able to suspend and revoke an already-provisioned actor using
+// the token already baked into it, without the provider object existing.
 func (s *Server) fetchCredentialProvider(ctx context.Context, atespace string, task *v1alpha1.Task) (*v1alpha1.CredentialProvider, error) {
 	ref := task.GetSpec().GetCredentialProvider()
 	if ref == nil {
@@ -406,6 +409,9 @@ func (s *Server) fetchCredentialProvider(ctx context.Context, atespace string, t
 	}
 	provider, err := s.store.GetCredentialProvider(ctx, atespace, ref.GetName())
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("fetching credential provider %s: %w", ref.GetName(), err)
 	}
 	return provider, nil

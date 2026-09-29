@@ -152,8 +152,13 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	if task.Status.Id == "" {
 		task.Status.Id = fmt.Sprintf("task-%s-%d", task.Metadata.Name, now.Unix())
 	}
+	// ref, not provider, is what says this task uses a credential provider: the
+	// provider object itself may be unavailable (deleted, or failing validation
+	// after an edit) while an already-provisioned actor still needs to be
+	// suspended and have its baked-in token revoked.
+	ref := task.Spec.GetCredentialProvider()
 	var existingActor *ateapipb.Actor
-	if provider != nil {
+	if ref != nil {
 		actor, err := r.client.GetActor(ctx, atespace, actorName)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return r.credentialFailure(task, "could not inspect actor", now)
@@ -163,10 +168,10 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	taskSuspending := task.Status.Phase == "Suspended"
 	// Suspending an actor that already exists only needs the token already baked
 	// into it; it does not mint or need workspace access, so a credential-provider
-	// update (e.g. a repository dropped from the allow-list) must never block it.
+	// update or deletion must never block it.
 	suspendingExisting := taskSuspending && existingActor != nil
 
-	if ref := task.Spec.GetCredentialProvider(); ref != nil && !suspendingExisting {
+	if ref != nil && !suspendingExisting {
 		if provider == nil || provider.GetMetadata().GetName() != ref.GetName() || provider.GetMetadata().GetAtespace() != atespace {
 			return r.credentialFailure(task, "credential provider is missing from the task atespace", now)
 		}
@@ -177,7 +182,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			return r.credentialFailure(task, err.Error(), now)
 		}
 	}
-	if provider != nil {
+	if ref != nil {
 		if existingActor != nil && (existingActor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING || existingActor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING) && !taskSuspending {
 			token, err := r.actorToken(ctx, existingActor)
 			if err != nil || token == "" {
@@ -421,6 +426,16 @@ DonePolling:
 	if provider != nil && !workspaceReady {
 		actor, err := r.client.GetActor(ctx, atespace, actorName)
 		if err == nil && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+			// The actor is already down; only the token needs cleaning up.
+			if !r.conditionTrue(task, condCredentialRevoked) {
+				if token, tokErr := r.actorToken(ctx, actor); tokErr == nil && token != "" {
+					if revokeErr := r.InstallationTokens.Revoke(ctx, token); revokeErr != nil {
+						slog.Warn("could not revoke installation token for crashed actor", "actor", actorName, "error", revokeErr)
+					} else {
+						r.setCondition(task, condCredentialRevoked, "True", "Revoked", "Installation token revoked", time.Now())
+					}
+				}
+			}
 			return r.credentialFailure(task, "credentialed actor failed during workspace setup", time.Now())
 		}
 	}

@@ -498,16 +498,24 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 	}
 }
 
-// ListActorTemplates returns all ActorTemplates in the given atespace.
+// ListActorTemplates returns all ActorTemplates in the given atespace, paging
+// through the full result set: template cleanup on task delete depends on
+// seeing every template, including ones from earlier credential rotations.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
-	resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
-	if err != nil {
-		return nil, fmt.Errorf("listing actor templates in %s: %w", atespace, err)
+	var templates []*ateapipb.ActorTemplate
+	pageToken := ""
+	for {
+		resp, err := c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace, PageToken: pageToken})
+		if err != nil {
+			return nil, fmt.Errorf("listing actor templates in %s: %w", atespace, err)
+		}
+		templates = append(templates, resp.GetActorTemplates()...)
+		pageToken = resp.GetNextPageToken()
+		if pageToken == "" {
+			break
+		}
 	}
-	if resp.GetNextPageToken() != "" {
-		slog.Warn("actor template listing was truncated", "atespace", atespace)
-	}
-	return resp.GetActorTemplates(), nil
+	return templates, nil
 }
 
 // DeleteActorTemplate deletes the specified ActorTemplate. A missing template is not an error.

@@ -261,6 +261,63 @@ func TestSuspendExistingActorIgnoresInvalidatedProvider(t *testing.T) {
 	}
 }
 
+// TestSuspendExistingActorWithDeletedProvider covers the server handing the
+// reconciler a nil provider because the CredentialProvider was deleted while
+// referenced by a task: suspending its already-provisioned actor must still
+// go through, revoking the token already baked into it, rather than silently
+// skipping the whole credentialed path because provider is nil.
+func TestSuspendExistingActorWithDeletedProvider(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	// Create suspended, then resume so the actor is running with a live,
+	// unrevoked token (mirrors the server's fetchCredentialProvider still
+	// finding the provider at this point).
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 2 || len(fake.revoked) != 1 {
+		t.Fatalf("minted=%d revoked=%v before deletion scenario", fake.minted, fake.revoked)
+	}
+
+	// The provider is now deleted: the server passes a nil provider through.
+	task.Status.Phase = "Suspended"
+	got, err := r.ReconcileWithProvider(ctx, task, nil)
+	if err != nil {
+		t.Fatalf("suspend failed with a deleted provider: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+	if len(fake.revoked) != 2 {
+		t.Fatalf("revoked=%v, want the actor's live token revoked despite the deleted provider", fake.revoked)
+	}
+}
+
 func TestCredentialedWorkspaceFailureFailsTask(t *testing.T) {
 	ready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusFailedDependency) }))
 	defer ready.Close()
