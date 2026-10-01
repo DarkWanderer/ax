@@ -792,11 +792,18 @@ func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, task
 			continue
 		}
 		if revokeCredentials {
-			if full, err := r.client.GetActorTemplate(ctx, atespace, name); err != nil {
+			full, err := r.client.GetActorTemplate(ctx, atespace, name)
+			if err != nil {
+				// Deleting this template now would destroy the only stored
+				// copy of whatever token it holds, with no later retry able
+				// to read it back out. Leave it in place for a retry instead.
 				errs = append(errs, fmt.Errorf("reading actor template %s for revocation: %w", name, err))
-			} else if token := templateToken(full); token != "" {
+				continue
+			}
+			if token := templateToken(full); token != "" {
 				if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
 					errs = append(errs, fmt.Errorf("revoking token from actor template %s: %w", name, err))
+					continue
 				}
 			}
 		}

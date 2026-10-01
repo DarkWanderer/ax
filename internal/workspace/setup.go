@@ -452,8 +452,11 @@ func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool,
 	defer cancel()
 	// gVisor disallows setuid in this sandbox. Allow only the tools this coding
 	// goal needs and decline any other permission request without prompting.
+	// "dontAsk" alone handles that: there is no separate "--permission-prompts"
+	// flag, and passing one makes the CLI exit during argument parsing without
+	// ever running the goal.
 	cmd := exec.CommandContext(ctx, "claude", "--print", "--permission-mode", "dontAsk",
-		"--permission-prompts", "none", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep")
+		"--allowedTools", "Bash,Edit,Write,Read,Glob,Grep")
 	if model := os.Getenv("AX_CLAUDE_MODEL"); model != "" {
 		cmd.Args = append(cmd.Args, "--model", model)
 	}

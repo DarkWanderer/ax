@@ -38,7 +38,8 @@ type fakeInstallationTokens struct {
 	minted       int
 	revoked      []string
 	repositories []string
-	revokeFails  int // the next N Revoke calls return an error instead of succeeding
+	revokeFails  int             // the next N Revoke calls return an error instead of succeeding
+	revokeErrFor map[string]bool // Revoke fails for exactly these tokens, regardless of call order
 }
 
 func (f *fakeInstallationTokens) Mint(_ context.Context, app *v1alpha1.GitHubAppCredential, _ string) (string, error) {
@@ -49,6 +50,9 @@ func (f *fakeInstallationTokens) Mint(_ context.Context, app *v1alpha1.GitHubApp
 func (f *fakeInstallationTokens) Revoke(_ context.Context, token string) error {
 	if f.revokeFails > 0 {
 		f.revokeFails--
+		return errors.New("transient revoke error")
+	}
+	if f.revokeErrFor[token] {
 		return errors.New("transient revoke error")
 	}
 	f.revoked = append(f.revoked, token)
@@ -1243,6 +1247,70 @@ func TestReconcileDelete_RevokesOrphanedTemplateTokens(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("revoked = %v, want the orphaned template's token revoked too", fake.revoked)
+	}
+}
+
+// TestReconcileDelete_KeepsTemplateWhenRevokeFails covers a template whose
+// token fails to revoke: deleting it anyway would destroy the only stored
+// copy of that still-live token, with no later retry able to read it back
+// out. It must be left in place instead.
+func TestReconcileDelete_KeepsTemplateWhenRevokeFails(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{
+		actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Name: "job", Atespace: "default"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "job-tmpl-aaaaaaaa"},
+			Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+		},
+		actorTemplates: map[string]bool{"job-tmpl-aaaaaaaa": true, "job-tmpl-bbbbbbbb": true},
+		createdTemplates: []*ateapipb.ActorTemplate{
+			{
+				Metadata:   &ateapipb.ResourceMetadata{Name: "job-tmpl-aaaaaaaa", Atespace: "default"},
+				Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "GITHUB_TOKEN", Value: "ghs_current"}}}},
+			},
+			{
+				Metadata:   &ateapipb.ResourceMetadata{Name: "job-tmpl-bbbbbbbb", Atespace: "default"},
+				Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "GITHUB_TOKEN", Value: "ghs_orphaned"}}}},
+			},
+		},
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = noSecrets
+	fake := &fakeInstallationTokens{revokeErrFor: map[string]bool{"ghs_orphaned": true}}
+	r.InstallationTokens = fake
+
+	// Template cleanup errors are logged, not propagated, matching
+	// ReconcileDelete's existing best-effort template cleanup.
+	if err := r.ReconcileDelete(ctx, "default", "job", true); err != nil {
+		t.Fatalf("ReconcileDelete failed: %v", err)
+	}
+	for _, name := range mockSrv.deletedTemplates {
+		if name == "job-tmpl-bbbbbbbb" {
+			t.Fatalf("deletedTemplates=%v, want the orphaned template (whose revoke failed) left in place for a retry", mockSrv.deletedTemplates)
+		}
+	}
+	found := false
+	for _, name := range mockSrv.deletedTemplates {
+		if name == "job-tmpl-aaaaaaaa" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deletedTemplates=%v, want the current template (whose revoke succeeded) still deleted", mockSrv.deletedTemplates)
 	}
 }
 

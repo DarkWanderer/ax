@@ -234,6 +234,14 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	goals.Wait()
 
+	// A cancellation while goals were running (task suspended or deleted)
+	// releases Wait above, but the command must not then start anyway: it
+	// could perform non-idempotent or external side effects during what is
+	// meant to be a shutdown.
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	cmdArgs := cfg.Task.GetSpec().GetCommand()
 	if len(cmdArgs) == 0 {
 		slog.Info("no task command specified; serving metadata until stopped")

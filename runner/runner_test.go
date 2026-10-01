@@ -235,6 +235,41 @@ echo goal >> ` + events + `
 	}
 }
 
+func TestRun_SkipsCommandAfterGoalCanceled(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	// A goal agent that outlives the cancellation below; exec.CommandContext
+	// kills it, so it never gets to write anything.
+	script := `#!/bin/sh
+sleep 5
+echo goal >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.task.Spec.Command = []string{"sh", "-c", "echo command >> " + events}
+	h.start(t)
+
+	// Give the goal a moment to actually start before cancelling, as a
+	// suspend or delete arriving mid-goal would.
+	time.Sleep(100 * time.Millisecond)
+	h.cancel()
+	h.waitFinished(t, 5*time.Second)
+
+	if out, err := os.ReadFile(events); err == nil {
+		t.Fatalf("events file should not exist (goal killed, command must not run after cancellation), got %q", out)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error checking events file: %v", err)
+	}
+}
+
 func TestRun_TaskEnvCannotDisableGitCredentialHelper(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghs_test_secret")
 	h := newHarness(t)

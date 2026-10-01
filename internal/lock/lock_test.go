@@ -21,7 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/google/ax/internal/lock"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestMemoryLocker_SerializesSameResource(t *testing.T) {
@@ -93,4 +95,51 @@ func TestMemoryLocker_Timeout(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected timeout error, got nil")
 	}
+}
+
+func newMiniredisLocker(t *testing.T, ttl, fallback time.Duration) *lock.RedisLocker {
+	t.Helper()
+	srv, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("starting miniredis: %v", err)
+	}
+	t.Cleanup(srv.Close)
+	client := redis.NewClient(&redis.Options{Addr: srv.Addr()})
+	t.Cleanup(func() { client.Close() })
+	return lock.NewRedisLocker(client, lock.RedisLockerOptions{TTL: ttl, FallbackInterval: fallback})
+}
+
+// TestRedisLocker_RenewsBeforeTTLExpires covers work held under the lock
+// running longer than its fixed TTL (as a credentialed resume realistically
+// can): without renewal, Redis would expire the key out from under the
+// holder and let a second Lock call acquire it while the first is still
+// active.
+func TestRedisLocker_RenewsBeforeTTLExpires(t *testing.T) {
+	locker := newMiniredisLocker(t, 100*time.Millisecond, 20*time.Millisecond)
+	ctx := context.Background()
+
+	unlock, err := locker.Lock(ctx, "task", "default", "job")
+	if err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+
+	// Outlive the original TTL several times over while still holding the
+	// lock, so renewal -- not luck -- is what's being exercised.
+	time.Sleep(350 * time.Millisecond)
+
+	contendedCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if _, err := locker.Lock(contendedCtx, "task", "default", "job"); err == nil {
+		t.Fatal("a second Lock call succeeded while the first lock, held past its TTL, was still active")
+	}
+
+	unlock()
+
+	releasedCtx, cancel2 := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel2()
+	unlock2, err := locker.Lock(releasedCtx, "task", "default", "job")
+	if err != nil {
+		t.Fatalf("Lock after unlock: %v", err)
+	}
+	unlock2()
 }

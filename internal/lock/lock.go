@@ -138,6 +138,17 @@ else
 end
 `)
 
+// renewScript extends a held lock's TTL only while this holder's token is
+// still the one in Redis, so a renewal racing a lock that has already
+// expired and been re-acquired by someone else can never extend their lock.
+var renewScript = redis.NewScript(`
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("pexpire", KEYS[1], ARGV[2])
+else
+    return 0
+end
+`)
+
 // ChannelKey returns the Pub/Sub channel used to notify waiters when a lock is released.
 func ChannelKey(kind, atespace, name string) string {
 	if atespace == "" {
@@ -175,8 +186,16 @@ func (r *RedisLocker) Lock(ctx context.Context, kind, atespace, name string) (fu
 
 	makeUnlock := func() func() {
 		var once sync.Once
+		stop := make(chan struct{})
+		// A held lock's work can run long enough to exceed its fixed TTL
+		// (e.g. a credentialed resume: token minting plus a workspace-ready
+		// poll), after which Redis would expire it out from under the
+		// holder and let a concurrent operation acquire the same lock while
+		// this one is still active. Renew it periodically until unlocked.
+		go r.renewLoop(key, token, stop)
 		return func() {
 			once.Do(func() {
+				close(stop)
 				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				_ = releaseAndNotifyScript.Run(releaseCtx, r.client, []string{key, chanKey}, token).Err()
@@ -232,6 +251,29 @@ func (r *RedisLocker) Lock(ctx context.Context, kind, atespace, name string) (fu
 		}
 		if ok {
 			return makeUnlock(), nil
+		}
+	}
+}
+
+// renewLoop periodically extends key's TTL while token is still the current
+// holder, until stop is closed. It uses its own background context, not the
+// lock holder's: renewal must keep running for as long as the lock is held,
+// independent of whatever context that caller's own work happens to use.
+func (r *RedisLocker) renewLoop(key, token string, stop <-chan struct{}) {
+	interval := r.ttl / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(context.Background(), r.ttl)
+			_ = renewScript.Run(renewCtx, r.client, []string{key}, token, r.ttl.Milliseconds()).Err()
+			cancel()
 		}
 	}
 }
