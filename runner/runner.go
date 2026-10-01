@@ -188,15 +188,9 @@ func Run(ctx context.Context, cfg Config) error {
 			ready = false
 		}
 	}
-	if ready {
-		metaServer.SetWorkspaceReady(true)
-		slog.Info("workspace maiden run setup marked ready", "count", len(mounts))
-	}
-
-	// Goals run only once the sandbox is ready: the agent needs the network,
-	// and Substrate's egress proxy carries traffic only for an actor its
-	// control plane considers running, which it is not until the readiness
-	// endpoint above answers. Each workspace's goal runs concurrently with the
+	// Goals need the network, which plain /readyz already unlocks
+	// independently of the workspace-specific flag set below (see
+	// handleReadyz). Each workspace's goal runs concurrently with the
 	// others, but the task's own command -- which may depend on goal-driven
 	// setup, e.g. a repository the goal itself creates -- does not start until
 	// every goal has finished.
@@ -233,6 +227,17 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	goals.Wait()
+
+	// Only now, after every goal has actually finished, is the workspace
+	// condition this flag backs (AX_TASK's WorkspaceReady, polled via
+	// /readyz?check=workspace) true: reporting it as soon as file setup
+	// finished let ResumeTask return and declare the task Ready while a
+	// goal was still modifying the workspace and before the command --
+	// which now waits on the same goals -- had even started.
+	if ready {
+		metaServer.SetWorkspaceReady(true)
+		slog.Info("workspace maiden run setup marked ready", "count", len(mounts))
+	}
 
 	// A cancellation while goals were running (task suspended or deleted)
 	// releases Wait above, but the command must not then start anyway: it

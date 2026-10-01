@@ -235,6 +235,53 @@ echo goal >> ` + events + `
 	}
 }
 
+// TestRun_WorkspaceReadyWaitsForGoal covers /readyz?check=workspace, which
+// backs the task's WorkspaceReady condition: it must stay not-ready while a
+// goal is still running, not flip to ready as soon as file setup finishes,
+// or the controller can declare the task Ready (and ResumeTask can return)
+// while the goal is still modifying the workspace.
+func TestRun_WorkspaceReadyWaitsForGoal(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	bin := t.TempDir()
+	script := "#!/bin/sh\nsleep 0.3\n"
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.start(t)
+
+	readyzURL := fmt.Sprintf("http://127.0.0.1:%d/readyz?check=workspace", h.cfg.Port)
+
+	time.Sleep(50 * time.Millisecond) // let the goal actually start
+	resp, err := http.Get(readyzURL)
+	if err != nil {
+		t.Fatalf("readyz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("workspace reported ready while its goal was still running")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(readyzURL)
+		if err == nil {
+			ok := resp.StatusCode == http.StatusOK
+			resp.Body.Close()
+			if ok {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("workspace never reported ready after its goal completed")
+}
+
 func TestRun_SkipsCommandAfterGoalCanceled(t *testing.T) {
 	t.Setenv("AX_GOAL_AGENT", "claude")
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")

@@ -303,6 +303,13 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	}
 
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
+	//
+	// templateApplicable tracks whether templateName/templateAtespace were
+	// actually (re)computed against the current extraEnv this round: when
+	// this step is skipped below (a credentialed resume that didn't mint a
+	// fresh token), they're left at the generic default and must not be
+	// compared against the actor's real, already-correct custom template.
+	templateApplicable := false
 	if !(provider != nil && newToken == "" && existingActor != nil) && task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
@@ -316,6 +323,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		} else if tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
 			templateName = tmpl.Metadata.Name
+			templateApplicable = true
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
 		}
 	}
@@ -335,10 +343,22 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
 	}
-	if provider != nil && newToken != "" && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
+	// Not gated on provider/newToken: a suspended actor's template can go
+	// stale from a controller-managed Claude/Gemini secret changing just as
+	// much as from a GitHub token rotating, and EnsureActor above already
+	// created the new template either way -- only switching the actor to it
+	// was still missing for the non-credentialed case. Still gated on
+	// templateApplicable, so a round where the custom-template step was
+	// itself skipped doesn't compare the actor's real template against a
+	// stale default and "switch" it away from the correct one.
+	if templateApplicable && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
 		if _, err := r.client.SetActorTemplate(ctx, ensuredActor, templateAtespace, templateName); err != nil {
-			r.revokeForCleanup(newToken)
-			return r.credentialFailure(task, "could not switch actor template", now)
+			if newToken != "" {
+				r.revokeForCleanup(newToken)
+			}
+			r.setNotReady(task, "TemplateSwitchFailed", err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, fmt.Errorf("switching actor template: %w", err)
 		}
 	}
 

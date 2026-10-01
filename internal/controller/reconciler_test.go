@@ -1603,6 +1603,62 @@ func TestTaskReconcilerClaudeCredential(t *testing.T) {
 	}
 }
 
+// TestClaudeSecretRotationAppliesToSuspendedActor covers a suspended,
+// non-credential-provider Claude task whose Anthropic secret is rotated:
+// EnsureActorTemplateWithImage creates a new template for the new secret
+// regardless of credential-provider status, but only switching the actor to
+// it was previously gated on provider != nil, so a suspended actor kept
+// resuming with its old, stale secret.
+func TestClaudeSecretRotationAppliesToSuspendedActor(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	secretValue := "key-v1"
+	reconciler.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return secretValue, nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "claude-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env:   []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+
+	secretValue = "key-v2"
+	task.Status.Phase = "Suspended"
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 2 {
+		t.Fatalf("created %d templates after secret rotation, want 2 (one per secret value)", len(mockSrv.createdTemplates))
+	}
+	wantTemplate := mockSrv.createdTemplates[1].GetMetadata().GetName()
+	if got := mockSrv.actor.GetActorTemplate().GetName(); got != wantTemplate {
+		t.Fatalf("suspended actor's template = %q, want switched to the rotated secret's template %q", got, wantTemplate)
+	}
+}
+
 func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
