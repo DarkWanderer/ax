@@ -624,6 +624,11 @@ type mockControlServer struct {
 	// server-side (as a real Substrate resume that actually succeeded would
 	// leave it), but the client never sees that success.
 	resumeActorErr error
+	// onSuspendActor, when set, is called synchronously after SuspendActor
+	// records success but before it returns, so a test can simulate the
+	// caller's context expiring in the narrow window right after a real
+	// Substrate suspend succeeds.
+	onSuspendActor func()
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -1180,6 +1185,65 @@ func TestReconcileDelete_RevokesOnlyForCredentialedTasks(t *testing.T) {
 			t.Fatalf("expected the actor to still be deleted, got %v", mockSrv.deletedActors)
 		}
 	})
+}
+
+// TestReconcileDelete_RevokesOrphanedTemplateTokens covers a task with more
+// than one ActorTemplate left behind across spec revisions: the actor only
+// ever references its newest template, so a GITHUB_TOKEN baked into an
+// older, orphaned one (e.g. left over from a revoke that failed or was
+// skipped on an earlier revision) would otherwise be deleted along with its
+// template without ever being revoked.
+func TestReconcileDelete_RevokesOrphanedTemplateTokens(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{
+		actor: &ateapipb.Actor{
+			Metadata:      &ateapipb.ResourceMetadata{Name: "job", Atespace: "default"},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "job-tmpl-aaaaaaaa"},
+			Status:        &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+		},
+		actorTemplates: map[string]bool{"job-tmpl-aaaaaaaa": true, "job-tmpl-bbbbbbbb": true},
+		createdTemplates: []*ateapipb.ActorTemplate{
+			{
+				Metadata:   &ateapipb.ResourceMetadata{Name: "job-tmpl-aaaaaaaa", Atespace: "default"},
+				Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "GITHUB_TOKEN", Value: "ghs_current"}}}},
+			},
+			{
+				Metadata:   &ateapipb.ResourceMetadata{Name: "job-tmpl-bbbbbbbb", Atespace: "default"},
+				Containers: []*ateapipb.Container{{Env: []*ateapipb.EnvVar{{Name: "GITHUB_TOKEN", Value: "ghs_orphaned"}}}},
+			},
+		},
+	}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = noSecrets
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+
+	if err := r.ReconcileDelete(ctx, "default", "job", true); err != nil {
+		t.Fatalf("ReconcileDelete failed: %v", err)
+	}
+	found := false
+	for _, tok := range fake.revoked {
+		if tok == "ghs_orphaned" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("revoked = %v, want the orphaned template's token revoked too", fake.revoked)
+	}
 }
 
 func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {

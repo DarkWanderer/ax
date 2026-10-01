@@ -18,6 +18,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/server"
 	"github.com/google/ax/internal/store/memory"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -51,5 +52,60 @@ func TestCredentialProviderTaskScope(t *testing.T) {
 	}
 	if _, err := s.GetCredentialProvider(ctx, &v1alpha1.GetCredentialProviderRequest{Atespace: "team-a", Name: "github"}); status.Code(err) != codes.NotFound {
 		t.Fatalf("get after delete: %v", err)
+	}
+}
+
+// orderTrackingStore wraps a Store to record when GetCredentialProvider is
+// called, so a test can check it happened after a lock was taken.
+type orderTrackingStore struct {
+	*memory.MemoryStore
+	log *[]string
+}
+
+func (s *orderTrackingStore) GetCredentialProvider(ctx context.Context, atespace, name string) (*v1alpha1.CredentialProvider, error) {
+	*s.log = append(*s.log, "get")
+	return s.MemoryStore.GetCredentialProvider(ctx, atespace, name)
+}
+
+// orderTrackingLocker wraps a Locker to record when Lock is called.
+type orderTrackingLocker struct {
+	lock.Locker
+	log *[]string
+}
+
+func (l *orderTrackingLocker) Lock(ctx context.Context, kind, atespace, name string) (func(), error) {
+	*l.log = append(*l.log, "lock")
+	return l.Locker.Lock(ctx, kind, atespace, name)
+}
+
+// TestUpdateCredentialProviderLocksBeforeReadingExisting covers the race an
+// update's read-modify-write of an existing provider's metadata could lose to
+// a concurrent delete: the lock must be held before defaultMetadata's lookup
+// reads the store, not just before the final save, or a delete that
+// interleaves between that read and the write could be undone by the update
+// saving a stale read back into existence.
+func TestUpdateCredentialProviderLocksBeforeReadingExisting(t *testing.T) {
+	ctx := context.Background()
+	var log []string
+	st := &orderTrackingStore{MemoryStore: memory.NewStore(), log: &log}
+	lk := &orderTrackingLocker{Locker: lock.NewMemoryLocker(), log: &log}
+	s := server.NewServer(st, server.Options{Locker: lk})
+
+	p := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team-a"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	// First call creates the provider; no existing one to read, but the log
+	// still shows the lock preceding the (not-found) lookup.
+	if _, err := s.UpdateCredentialProvider(ctx, &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: p}); err != nil {
+		t.Fatal(err)
+	}
+	// Second call updates it with a fresh request (CreationTimestamp unset,
+	// as a real client's would be), so defaultMetadata's lookup now finds a
+	// real provider to read -- this is the read the lock must precede.
+	log = nil
+	p2 := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team-a"}, Spec: p.Spec}
+	if _, err := s.UpdateCredentialProvider(ctx, &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: p2}); err != nil {
+		t.Fatal(err)
+	}
+	if len(log) < 2 || log[0] != "lock" || log[1] != "get" {
+		t.Fatalf("call order = %v, want lock before get", log)
 	}
 }

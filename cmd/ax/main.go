@@ -899,7 +899,12 @@ func runResume(serverURL, atespace string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Comfortably longer than the reconciler's own workspace-readiness poll
+	// window (up to 15s by default) plus the resume RPC itself: a deadline
+	// that merely matches it can expire mid-poll, which loses the server's
+	// final status write and leaves the task stored as Suspended even though
+	// its actor actually resumed.
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	if _, err := client.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Atespace: atespace, Name: name}); err != nil {

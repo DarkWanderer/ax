@@ -62,6 +62,26 @@ func (s *Server) UpdateCredentialProvider(ctx context.Context, req *v1alpha1.Upd
 	if err := v1alpha1.ValidateCredentialProvider(p); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if p.Metadata == nil {
+		p.Metadata = &v1alpha1.ObjectMeta{}
+	}
+	if p.Metadata.Atespace == "" {
+		p.Metadata.Atespace = "default"
+	}
+	atespace := p.Metadata.Atespace
+	name := p.Metadata.Name
+
+	// Acquire exclusive lock for this credential provider before the
+	// defaultMetadata lookup below reads the store, so a concurrent delete
+	// can't acquire the lock and report success in between this update's
+	// read and its write, which would otherwise save the provider back into
+	// existence using that now-stale read.
+	unlock, err := s.locker.Lock(ctx, "credentialprovider", atespace, name)
+	if err != nil {
+		return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, name, err)
+	}
+	defer unlock()
+
 	p.Metadata = defaultMetadata(p.Metadata, func(atespace, name string) *v1alpha1.ObjectMeta {
 		old, err := s.store.GetCredentialProvider(ctx, atespace, name)
 		if err != nil {
@@ -69,17 +89,6 @@ func (s *Server) UpdateCredentialProvider(ctx context.Context, req *v1alpha1.Upd
 		}
 		return old.GetMetadata()
 	})
-
-	atespace := p.Metadata.Atespace
-	name := p.Metadata.Name
-
-	// Acquire exclusive lock for this credential provider, so a concurrent
-	// delete can't be undone by an update racing it back into existence.
-	unlock, err := s.locker.Lock(ctx, "credentialprovider", atespace, name)
-	if err != nil {
-		return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, name, err)
-	}
-	defer unlock()
 
 	if p.ApiVersion == "" {
 		p.ApiVersion = v1alpha1.APIVersion

@@ -324,6 +324,10 @@ type fakeReconciler struct {
 	deleteCount    int
 	deleteErr      error
 	onDelete       func(ctx context.Context, atespace, taskName string) error
+	// cancelCtx, when set, is called right after a successful reconcile, to
+	// simulate the caller's context expiring exactly in the gap between
+	// reconciliation finishing and the handler's final status write.
+	cancelCtx context.CancelFunc
 }
 
 func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
@@ -335,6 +339,9 @@ func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	task.Status = &v1alpha1.TaskStatus{
 		Phase: task.GetStatus().GetPhase(),
 	}
+	if f.cancelCtx != nil {
+		f.cancelCtx()
+	}
 	return task, nil
 }
 
@@ -344,6 +351,42 @@ func (f *fakeReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 		return f.onDelete(ctx, atespace, taskName)
 	}
 	return f.deleteErr
+}
+
+// TestResumeTaskPersistsStatusDespiteExpiredRequestContext covers a request
+// context that expires exactly after reconciliation succeeds but before the
+// resulting status is persisted -- as a client-set deadline that merely
+// matches the reconciler's own workspace-readiness poll window easily can.
+// The final status write must not be lost to that same expired context, or a
+// genuinely successful resume gets reported as failed and the task is left
+// stored as Suspended while its actor is actually running.
+func TestResumeTaskPersistsStatusDespiteExpiredRequestContext(t *testing.T) {
+	rec := &fakeReconciler{}
+	srv := server.NewServer(memory.NewStore(), server.Options{Reconciler: rec})
+
+	if _, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "task-resume"}, Spec: &v1alpha1.TaskSpec{Image: "alpine"}},
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rec.cancelCtx = cancel
+	task, err := srv.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Name: "task-resume"})
+	if err != nil {
+		t.Fatalf("ResumeTask failed even though the context only expired after reconciliation succeeded: %v", err)
+	}
+	if task.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("returned phase = %q, want Running", task.GetStatus().GetPhase())
+	}
+
+	stored, err := srv.GetTask(context.Background(), &v1alpha1.GetTaskRequest{Name: "task-resume"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if stored.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("stored phase = %q, want Running (the status write must not be lost to the expired request context)", stored.GetStatus().GetPhase())
+	}
 }
 
 func TestServer_DirectReconcilerLifecycle(t *testing.T) {

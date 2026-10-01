@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
@@ -30,6 +31,14 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// statusWriteTimeout bounds the final task-status write after ResumeTask's
+// reconcile. It deliberately does not reuse the request ctx: that ctx may be
+// close to its own client-set deadline after a reconcile that spent most of
+// it polling workspace readiness, and losing this write to that exhaustion
+// would report a successful resume as failed and leave the stored task
+// Suspended while its actor is actually running.
+const statusWriteTimeout = 10 * time.Second
 
 // Reconciler coordinates sandbox/actor lifecycles on Agent Substrate directly.
 type Reconciler interface {
@@ -368,7 +377,10 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 			return nil, status.Errorf(codes.Internal, "resuming task on substrate: %v", err)
 		}
 		task.Status = reconciled.Status
-		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
+		statusCtx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+		err = s.store.UpdateTaskStatus(statusCtx, atespace, taskName, task.Status)
+		cancel()
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 		}
 	} else {

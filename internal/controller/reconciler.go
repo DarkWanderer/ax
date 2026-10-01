@@ -573,16 +573,19 @@ func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorNa
 			return fmt.Errorf("could not suspend actor: %w", err)
 		}
 	}
-	token, err := r.actorToken(ctx, actor)
+	// A fresh context for both the token read and its revoke: ctx may be
+	// close to its deadline after SuspendActor above (which can itself run
+	// long), and the actor is confirmed stopped at this point regardless --
+	// losing the token read to a now-exhausted ctx would report this failed
+	// even though suspension genuinely succeeded, and leave the token
+	// unrevoked until a retry.
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+	defer cancel()
+	token, err := r.actorToken(cleanupCtx, actor)
 	if err != nil {
 		return fmt.Errorf("could not read actor token for revocation: %w", err)
 	}
 	if token != "" {
-		// A fresh context: this can run after ctx has been waiting on a poll
-		// loop or another failed step, and revocation must not be skipped just
-		// because ctx is now canceled or past its deadline.
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
-		defer cancel()
 		if err := r.InstallationTokens.Revoke(cleanupCtx, token); err != nil {
 			return fmt.Errorf("could not revoke installation token: %w", err)
 		}
@@ -630,14 +633,20 @@ func (r *TaskReconciler) actorToken(ctx context.Context, actor *ateapipb.Actor) 
 	if err != nil {
 		return "", err
 	}
+	return templateToken(tmpl), nil
+}
+
+// templateToken extracts the GITHUB_TOKEN baked into an ActorTemplate's
+// container environment, or "" if it has none.
+func templateToken(tmpl *ateapipb.ActorTemplate) string {
 	for _, container := range tmpl.GetContainers() {
 		for _, env := range container.GetEnv() {
 			if env.GetName() == "GITHUB_TOKEN" {
-				return env.GetValue(), nil
+				return env.GetValue()
 			}
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // conditionTrue reports whether the task currently has the given condition with status True.
@@ -754,7 +763,7 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 	if err := r.client.DeleteActor(ctx, atespace, taskName); err != nil {
 		return err
 	}
-	if err := r.deleteTaskTemplates(ctx, atespace, taskName); err != nil {
+	if err := r.deleteTaskTemplates(ctx, atespace, taskName, hasCredentialProvider); err != nil {
 		slog.Warn("could not clean up actor templates for task", "task", taskName, "error", err)
 	}
 	return nil
@@ -764,7 +773,13 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 // accumulate across spec revisions, so this matches by name pattern rather than
 // recomputing a single digest. If an actor deletion is still finishing in Substrate,
 // template deletion may briefly return Aborted, so we retry with backoff.
-func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, taskName string) error {
+//
+// A task's current actor only ever references its newest template, so a
+// GITHUB_TOKEN baked into an older, orphaned one (left behind by a failed or
+// skipped revoke on an earlier spec revision) is never reached by the revoke
+// in ReconcileDelete above. revokeCredentials must be true only when the
+// task referenced a CredentialProvider, matching ReconcileDelete's own gate.
+func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, taskName string, revokeCredentials bool) error {
 	templates, err := r.client.ListActorTemplates(ctx, atespace)
 	if err != nil {
 		return err
@@ -775,6 +790,15 @@ func (r *TaskReconciler) deleteTaskTemplates(ctx context.Context, atespace, task
 		name := tmpl.GetMetadata().GetName()
 		if !pattern.MatchString(name) {
 			continue
+		}
+		if revokeCredentials {
+			if full, err := r.client.GetActorTemplate(ctx, atespace, name); err != nil {
+				errs = append(errs, fmt.Errorf("reading actor template %s for revocation: %w", name, err))
+			} else if token := templateToken(full); token != "" {
+				if err := r.InstallationTokens.Revoke(ctx, token); err != nil {
+					errs = append(errs, fmt.Errorf("revoking token from actor template %s: %w", name, err))
+				}
+			}
 		}
 		slog.Info("deleting Substrate actor template for task", "atespace", atespace, "task", taskName, "template", name)
 		var delErr error
