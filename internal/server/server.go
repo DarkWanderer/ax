@@ -32,12 +32,14 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// statusWriteTimeout bounds the final task-status write after ResumeTask's
-// reconcile. It deliberately does not reuse the request ctx: that ctx may be
-// close to its own client-set deadline after a reconcile that spent most of
-// it polling workspace readiness, and losing this write to that exhaustion
-// would report a successful resume as failed and leave the stored task
-// Suspended while its actor is actually running.
+// statusWriteTimeout bounds the final task-status write after ResumeTask's or
+// SuspendTask's reconcile. It deliberately does not reuse the request ctx:
+// that ctx may be close to its own client-set deadline after a reconcile
+// that ran long (e.g. ResumeTask polling workspace readiness, or SuspendTask
+// revoking a token on its own fresh cleanup context after ctx expired), and
+// losing this write to that exhaustion would report a successful operation
+// as failed and leave the stored task out of sync with its actor's and
+// token's actual state.
 const statusWriteTimeout = 10 * time.Second
 
 // Reconciler coordinates sandbox/actor lifecycles on Agent Substrate directly.
@@ -321,7 +323,10 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 			return nil, status.Errorf(codes.Internal, "suspending task on substrate: %v", err)
 		}
 		task.Status = reconciled.Status
-		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
+		statusCtx, cancel := context.WithTimeout(context.Background(), statusWriteTimeout)
+		err = s.store.UpdateTaskStatus(statusCtx, atespace, taskName, task.Status)
+		cancel()
+		if err != nil {
 			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 		}
 	} else {

@@ -609,9 +609,12 @@ func TestCredentialedWorkspaceRejectsCaseVariantSCPURL(t *testing.T) {
 
 // TestCredentialedWorkspaceRejectsTrailingDotHostname covers the absolute-DNS
 // form "github.com." (a valid, distinct hostname string that Git and DNS both
-// still treat as github.com): without normalizing it before comparison, a
+// still treat as github.com): without recognizing it before comparison, a
 // repository on it would skip GitHub-specific validation entirely, letting an
-// unlisted repository or one with embedded credentials through.
+// unlisted repository or one with embedded credentials through. It is
+// rejected outright rather than normalized and accepted, since the runner's
+// credential helper matches the host Git supplies exactly and would not
+// recognize it either, failing authentication at clone time instead.
 func TestCredentialedWorkspaceRejectsTrailingDotHostname(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -636,8 +639,8 @@ func TestCredentialedWorkspaceRejectsTrailingDotHostname(t *testing.T) {
 	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com./org/private.git"}}}}
 
 	_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
-	if err == nil || !strings.Contains(err.Error(), "not listed") {
-		t.Fatalf("trailing-dot GitHub hostname was not validated: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "trailing dot") {
+		t.Fatalf("trailing-dot GitHub hostname was not rejected: %v", err)
 	}
 }
 
@@ -1327,10 +1330,11 @@ func TestReconcileDelete_KeepsTemplateWhenRevokeFails(t *testing.T) {
 	fake := &fakeInstallationTokens{revokeErrFor: map[string]bool{"ghs_orphaned": true}}
 	r.InstallationTokens = fake
 
-	// Template cleanup errors are logged, not propagated, matching
-	// ReconcileDelete's existing best-effort template cleanup.
-	if err := r.ReconcileDelete(ctx, "default", "job", true); err != nil {
-		t.Fatalf("ReconcileDelete failed: %v", err)
+	// Propagated, not merely logged: the task record must not be deleted
+	// while an orphaned template's token is still unrevoked, or that
+	// template becomes unreachable for any later retry.
+	if err := r.ReconcileDelete(ctx, "default", "job", true); err == nil {
+		t.Fatal("expected the orphaned template's failed revoke to fail ReconcileDelete")
 	}
 	for _, name := range mockSrv.deletedTemplates {
 		if name == "job-tmpl-bbbbbbbb" {
@@ -1656,6 +1660,64 @@ func TestClaudeSecretRotationAppliesToSuspendedActor(t *testing.T) {
 	wantTemplate := mockSrv.createdTemplates[1].GetMetadata().GetName()
 	if got := mockSrv.actor.GetActorTemplate().GetName(); got != wantTemplate {
 		t.Fatalf("suspended actor's template = %q, want switched to the rotated secret's template %q", got, wantTemplate)
+	}
+}
+
+// TestClaudeSecretRotationDeferredWhileActorRunning covers a running (not
+// suspended) Claude task whose secret rotates: SetActorTemplate's contract
+// only supports a suspended actor, so attempting the switch against a
+// running one would fail and, unguarded, incorrectly mark an otherwise
+// healthy running task Failed. The switch must be skipped instead, deferred
+// until the actor is next actually suspended and resumed.
+func TestClaudeSecretRotationDeferredWhileActorRunning(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	secretValue := "key-v1"
+	reconciler.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return secretValue, nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "claude-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env:   []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+	// Create (suspended), then resume so the actor is RUNNING.
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Phase = "Running"
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	runningTemplate := mockSrv.actor.GetActorTemplate().GetName()
+
+	secretValue = "key-v2"
+	got, err := reconciler.Reconcile(context.Background(), task, nil)
+	if err != nil {
+		t.Fatalf("Reconcile failed (switch should be deferred, not errored): %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running (must not be marked Failed)", got.GetStatus().GetPhase())
+	}
+	if got := mockSrv.actor.GetActorTemplate().GetName(); got != runningTemplate {
+		t.Fatalf("running actor's template = %q, want unchanged (%q) until it's actually suspended", got, runningTemplate)
 	}
 }
 

@@ -188,12 +188,26 @@ func Run(ctx context.Context, cfg Config) error {
 			ready = false
 		}
 	}
+	// WorkspaceReady is reported as soon as file setup finishes, not after
+	// goals too: goals can run far longer than the reconciler's own
+	// WorkspaceReadyTimeout poll window (minutes, against a default 15s),
+	// and nothing currently re-triggers reconciliation once that poll gives
+	// up, so waiting for goals here would leave the condition stuck False
+	// long after the workspace, and often the goal, actually finished. This
+	// does mean ResumeTask can report Ready while a goal is still running;
+	// that tradeoff is accepted for now rather than adding a background
+	// reconciliation loop.
+	if ready {
+		metaServer.SetWorkspaceReady(true)
+		slog.Info("workspace maiden run setup marked ready", "count", len(mounts))
+	}
+
 	// Goals need the network, which plain /readyz already unlocks
-	// independently of the workspace-specific flag set below (see
-	// handleReadyz). Each workspace's goal runs concurrently with the
-	// others, but the task's own command -- which may depend on goal-driven
-	// setup, e.g. a repository the goal itself creates -- does not start until
-	// every goal has finished.
+	// independently of the workspace-specific flag above (see handleReadyz).
+	// Each workspace's goal runs concurrently with the others, but the
+	// task's own command -- which may depend on goal-driven setup, e.g. a
+	// repository the goal itself creates -- does not start until every goal
+	// has finished.
 	var goals sync.WaitGroup
 	// Two bindings can name the same directory without matching as strings
 	// (e.g. "/workspace/a" and "/workspace/./a"); RunGoal canonicalizes its
@@ -227,17 +241,6 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 	goals.Wait()
-
-	// Only now, after every goal has actually finished, is the workspace
-	// condition this flag backs (AX_TASK's WorkspaceReady, polled via
-	// /readyz?check=workspace) true: reporting it as soon as file setup
-	// finished let ResumeTask return and declare the task Ready while a
-	// goal was still modifying the workspace and before the command --
-	// which now waits on the same goals -- had even started.
-	if ready {
-		metaServer.SetWorkspaceReady(true)
-		slog.Info("workspace maiden run setup marked ready", "count", len(mounts))
-	}
 
 	// A cancellation while goals were running (task suspended or deleted)
 	// releases Wait above, but the command must not then start anyway: it

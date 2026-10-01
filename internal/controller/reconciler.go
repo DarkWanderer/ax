@@ -352,7 +352,15 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	// itself skipped doesn't compare the actor's real template against a
 	// stale default and "switch" it away from the correct one.
 	if templateApplicable && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
-		if _, err := r.client.SetActorTemplate(ctx, ensuredActor, templateAtespace, templateName); err != nil {
+		// SetActorTemplate's contract only supports a suspended actor. A
+		// running actor (e.g. a non-credentialed resume whose secret rotated
+		// mid-flight) can't take the new template now; skip it here rather
+		// than failing the whole reconcile and marking an otherwise-healthy
+		// running task Failed -- it picks up the current template next time
+		// it's actually suspended and resumed.
+		if ensuredActor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+			slog.Info("actor template changed but actor is not suspended; deferring the switch", "actor", actorName, "state", ensuredActor.GetStatus().GetState())
+		} else if _, err := r.client.SetActorTemplate(ctx, ensuredActor, templateAtespace, templateName); err != nil {
 			if newToken != "" {
 				r.revokeForCleanup(newToken)
 			}
@@ -630,12 +638,21 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 				return fmt.Errorf("invalid Git repository URL")
 			}
 			// A trailing dot makes an otherwise-identical hostname a valid,
-			// distinct absolute DNS name ("github.com."), which Git and the
-			// credential helper still treat as github.com -- so it must not
-			// let a repository skip GitHub-specific validation.
-			host := strings.TrimSuffix(u.Hostname(), ".")
-			if !strings.EqualFold(host, "github.com") {
+			// distinct absolute DNS name ("github.com."), which DNS and Git
+			// both still resolve to github.com -- so it must not let a
+			// repository skip GitHub-specific validation below. It is
+			// rejected outright rather than normalized and accepted: the
+			// runner's credential helper matches the host Git supplies
+			// exactly, so a validated-but-not-exactly-"github.com" URL would
+			// pass validation here and then fail to authenticate at clone
+			// time instead.
+			host := u.Hostname()
+			trimmedHost := strings.TrimSuffix(host, ".")
+			if !strings.EqualFold(trimmedHost, "github.com") {
 				continue
+			}
+			if host != trimmedHost {
+				return fmt.Errorf("credentialed GitHub repository hostname must not have a trailing dot")
 			}
 			if u.Scheme != "https" || u.User != nil {
 				return fmt.Errorf("credentialed GitHub repository must use HTTPS without embedded credentials")
@@ -788,8 +805,13 @@ func (r *TaskReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 	if err := r.client.DeleteActor(ctx, atespace, taskName); err != nil {
 		return err
 	}
+	// Propagated, not merely logged: deleteTaskTemplates deliberately leaves
+	// a template in place when reading or revoking its token failed, so a
+	// retry can still reach it -- but DeleteTask only skips deleting the
+	// task record when ReconcileDelete itself returns an error, and that
+	// record is this template's only remaining path to a retry.
 	if err := r.deleteTaskTemplates(ctx, atespace, taskName, hasCredentialProvider); err != nil {
-		slog.Warn("could not clean up actor templates for task", "task", taskName, "error", err)
+		return fmt.Errorf("cleaning up actor templates: %w", err)
 	}
 	return nil
 }
