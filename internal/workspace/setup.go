@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
@@ -508,6 +509,12 @@ func legacyMarkerName(path string) string {
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
 }
 
+// maxReadablePrefixBytes bounds sanitizePath's human-readable prefix so the
+// marker name it feeds into (plus the fixed "initialized-"/".goal" wrapping
+// and the full digest) can never approach Linux's 255-byte NAME_MAX, however
+// long or deeply nested the source path is.
+const maxReadablePrefixBytes = 150
+
 // sanitizePath turns a workspace path into a filesystem-safe, unique-per-path
 // identifier, for naming per-workspace files and directories under AXDir. Any
 // character-substitution scheme for "/" is inherently ambiguous once the
@@ -527,8 +534,21 @@ func sanitizePath(path string) string {
 		clean = "root"
 	}
 	readable := strings.ReplaceAll(clean, "/", "-")
+	readable = truncateUTF8(readable, maxReadablePrefixBytes)
 	sum := sha256.Sum256([]byte(clean))
 	return readable + "-" + hex.EncodeToString(sum[:])
+}
+
+// truncateUTF8 shortens s to at most maxBytes bytes without splitting a
+// multi-byte rune.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }
 
 // writeMarker records a completed maiden run.

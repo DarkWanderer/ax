@@ -386,6 +386,48 @@ func TestAmbiguousResumeFailureSuspendsActorBeforeRevoking(t *testing.T) {
 	}
 }
 
+// TestAmbiguousResumeFailureKeepsTokenWhenSuspendFails covers the case where
+// the suspend attempted after an ambiguous resume failure itself fails (as it
+// would if resume's own failure were a canceled/expired context, which the
+// suspend must not reuse): the token must not be revoked in that case, since
+// the actor's state was never confirmed and a running actor is better left
+// with a still-valid token than a dead one.
+func TestAmbiguousResumeFailureKeepsTokenWhenSuspendFails(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{resumeActorErr: errors.New("deadline exceeded"), suspendActorErr: errors.New("transient substrate error")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err == nil {
+		t.Fatal("expected the ambiguous resume failure to be reported as an error")
+	}
+	if len(mock.suspendedActors) != 0 {
+		t.Fatalf("suspendedActors=%v, want none recorded since SuspendActor itself errored", mock.suspendedActors)
+	}
+	if len(fake.revoked) != 0 {
+		t.Fatalf("revoked=%v, want nothing revoked while the actor's state is unconfirmed", fake.revoked)
+	}
+}
+
 // TestSuspendExistingActorIgnoresInvalidatedProvider covers suspending an
 // already-provisioned actor after its credential provider has been edited into
 // something that would now fail validation (e.g. a dropped repository).
@@ -685,6 +727,11 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 	name := ""
 	if req.Actor != nil {
 		name = req.Actor.Name
+	}
+	if name == m.crashedActor {
+		// Matches real Substrate: a crashed actor must be reverted (back to
+		// SUSPENDED) before it will accept a suspend.
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %q is crashed; revert it first", name)
 	}
 	m.suspendedActors = append(m.suspendedActors, name)
 	if m.actor != nil {
@@ -1296,6 +1343,46 @@ func TestCredentialedResumeSwitchesTemplateAfterCrashRevert(t *testing.T) {
 	}
 	if mockSrv.actor.GetActorTemplate().GetName() == "" {
 		t.Fatal("reverted actor never had its template switched to the credentialed one")
+	}
+}
+
+// TestSuspendCrashedActorRevokesWithoutCallingSuspendActor covers suspending
+// a credentialed actor that has crashed: real Substrate rejects SuspendActor
+// on a crashed actor until it's been reverted, so suspendAndRevoke must not
+// call it there -- a crashed actor is already stopped, so it only needs its
+// token cleaned up.
+func TestSuspendCrashedActorRevokesWithoutCallingSuspendActor(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{crashedActor: "job"}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Phase: "Suspended", Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatalf("suspending a crashed actor failed: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+	if len(mockSrv.suspendedActors) != 0 {
+		t.Fatalf("suspendedActors=%v, want SuspendActor never called on a crashed actor", mockSrv.suspendedActors)
 	}
 }
 

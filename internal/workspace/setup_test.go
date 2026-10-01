@@ -312,6 +312,23 @@ func TestMarkerNameCollisionResistant(t *testing.T) {
 	}
 }
 
+func TestMarkerNameStaysWithinNAME_MAX(t *testing.T) {
+	// A long but entirely valid nested path (each component well under 255
+	// bytes) that would, without a bound on the readable prefix, flatten into
+	// a single filename component over Linux's 255-byte NAME_MAX.
+	segment := strings.Repeat("a", 40)
+	path := "/" + strings.Repeat(segment+"/", 10)
+
+	name := workspace.MarkerName(path)
+	if len(name) > 255 {
+		t.Fatalf("MarkerName length = %d, want <= 255 (NAME_MAX): %q", len(name), name)
+	}
+	// And the goal marker's own suffix must also fit.
+	if got := len(name) + len(".goal"); got > 255 {
+		t.Fatalf("MarkerName+.goal length = %d, want <= 255", got)
+	}
+}
+
 func TestSetupWorkspace_InlinedFiles(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "ax-ws-files-*")
 	if err != nil {

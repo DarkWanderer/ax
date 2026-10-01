@@ -381,10 +381,22 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			// RUNNING and skip rotating the token, so it would never recover.
 			// Force it back to SUSPENDED first (a no-op if it never actually
 			// resumed) so the next attempt mints and applies a fresh token.
-			if suspendErr := r.client.SuspendActor(ctx, atespace, actorName); suspendErr != nil {
-				slog.Warn("could not suspend actor after ambiguous resume failure", "actor", actorName, "error", suspendErr)
+			//
+			// ctx itself may be why ResumeActor just failed (canceled or past
+			// its deadline), in which case reusing it here would make this
+			// suspend fail too without ever reaching Substrate -- so use a
+			// fresh, independently bounded context. And only revoke once that
+			// suspend is confirmed: revoking on an unconfirmed suspend risks
+			// the actor still running with a now-dead token for good, whereas
+			// leaving a still-valid token on a running actor is harmless.
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+			suspendErr := r.client.SuspendActor(cleanupCtx, atespace, actorName)
+			cancel()
+			if suspendErr != nil {
+				slog.Warn("could not suspend actor after ambiguous resume failure; leaving its token live rather than risk stranding a running actor with a dead one", "actor", actorName, "error", suspendErr)
+			} else {
+				r.revokeForCleanup(newToken)
 			}
-			r.revokeForCleanup(newToken)
 		}
 		r.setNotReady(task, "ActorResumeFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
@@ -550,7 +562,13 @@ func (r *TaskReconciler) revokeForCleanup(token string) {
 // in task status: that status can be lost (a failed or skipped status write)
 // independently of whether the actor's actual, current token was revoked.
 func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorName string, actor *ateapipb.Actor) error {
-	if actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+	state := actor.GetStatus().GetState()
+	// A crashed actor is already stopped, not merely in need of suspending --
+	// and Substrate requires RevertActor (back to SUSPENDED) before it will
+	// accept a SuspendActor call on it, which this helper has no reason to
+	// do on behalf of a caller that just wants the token cleaned up. Treat it
+	// like SUSPENDED: skip straight to revoking.
+	if state != ateapipb.ActorState_ACTOR_STATE_SUSPENDED && state != ateapipb.ActorState_ACTOR_STATE_CRASHED {
 		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
 			return fmt.Errorf("could not suspend actor: %w", err)
 		}

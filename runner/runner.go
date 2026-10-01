@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -200,6 +201,12 @@ func Run(ctx context.Context, cfg Config) error {
 	// setup, e.g. a repository the goal itself creates -- does not start until
 	// every goal has finished.
 	var goals sync.WaitGroup
+	// Two bindings can name the same directory without matching as strings
+	// (e.g. "/workspace/a" and "/workspace/./a"); RunGoal canonicalizes its
+	// path internally, so launching both concurrently would race on the same
+	// goal marker. Canonicalize here too, so only the first binding for a
+	// given real path gets a goal goroutine.
+	launchedGoalFor := make(map[string]bool, len(mounts))
 	for i, m := range mounts {
 		if goal := m.ref.GetGoal(); ready && goal != "" {
 			if legacyGoal[i] {
@@ -207,6 +214,15 @@ func Run(ctx context.Context, cfg Config) error {
 				workspace.MarkGoalHandledByLegacySetup(m.path)
 				continue
 			}
+			canon := m.path
+			if abs, err := filepath.Abs(canon); err == nil {
+				canon = abs
+			}
+			if launchedGoalFor[canon] {
+				slog.Warn("workspace goal skipped: another binding already targets this path", "workspace", m.ref.GetName(), "path", m.path)
+				continue
+			}
+			launchedGoalFor[canon] = true
 			goals.Add(1)
 			go func(path, goal, name string) {
 				defer goals.Done()

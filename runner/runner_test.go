@@ -195,6 +195,46 @@ echo goal >> ` + events + `
 	}
 }
 
+func TestRun_SkipsGoalForCanonicalDuplicatePath(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+echo goal >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	// Two bindings naming the same real directory with textually distinct
+	// paths; without canonicalizing before dedup, both would get their own
+	// goal goroutine and race on the same goal marker.
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces, &v1alpha1.WorkspaceRef{
+		Name: "ws-alias",
+		Path: h.wsPath + "/.",
+		Goal: "do something",
+	})
+	h.task.Spec.Command = []string{"true"}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("events file missing: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "goal" {
+		t.Errorf("goal ran %d time(s) (%q), want exactly once for two aliased paths", strings.Count(got, "goal"), got)
+	}
+}
+
 func TestRun_TaskEnvCannotDisableGitCredentialHelper(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghs_test_secret")
 	h := newHarness(t)
