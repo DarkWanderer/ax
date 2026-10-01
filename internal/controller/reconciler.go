@@ -609,7 +609,12 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 			if err != nil {
 				return fmt.Errorf("invalid Git repository URL")
 			}
-			if !strings.EqualFold(u.Hostname(), "github.com") {
+			// A trailing dot makes an otherwise-identical hostname a valid,
+			// distinct absolute DNS name ("github.com."), which Git and the
+			// credential helper still treat as github.com -- so it must not
+			// let a repository skip GitHub-specific validation.
+			host := strings.TrimSuffix(u.Hostname(), ".")
+			if !strings.EqualFold(host, "github.com") {
 				continue
 			}
 			if u.Scheme != "https" || u.User != nil {

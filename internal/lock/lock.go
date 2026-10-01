@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -259,6 +260,13 @@ func (r *RedisLocker) Lock(ctx context.Context, kind, atespace, name string) (fu
 // holder, until stop is closed. It uses its own background context, not the
 // lock holder's: renewal must keep running for as long as the lock is held,
 // independent of whatever context that caller's own work happens to use.
+//
+// There is no way, within this interface, to cancel the holder's in-flight
+// operation once a renewal confirms the lease is gone (e.g. Redis was
+// unreachable for longer than the TTL) -- Lock returns only an unlock func,
+// not a context the caller observes. So a lost lease can't be fenced here;
+// it can only be made loud, so it shows up in logs/alerting instead of
+// silently letting a second holder operate concurrently with this one.
 func (r *RedisLocker) renewLoop(key, token string, stop <-chan struct{}) {
 	interval := r.ttl / 3
 	if interval <= 0 {
@@ -272,8 +280,16 @@ func (r *RedisLocker) renewLoop(key, token string, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			renewCtx, cancel := context.WithTimeout(context.Background(), r.ttl)
-			_ = renewScript.Run(renewCtx, r.client, []string{key}, token, r.ttl.Milliseconds()).Err()
+			n, err := renewScript.Run(renewCtx, r.client, []string{key}, token, r.ttl.Milliseconds()).Int64()
 			cancel()
+			if err != nil {
+				slog.Error("failed to renew held lock; it may expire before the operation holding it finishes", "key", key, "error", err)
+				continue
+			}
+			if n == 0 {
+				slog.Error("lost ownership of held lock before it was released; a concurrent holder may now be racing this operation", "key", key)
+				return
+			}
 		}
 	}
 }

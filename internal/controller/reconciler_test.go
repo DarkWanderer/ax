@@ -607,6 +607,40 @@ func TestCredentialedWorkspaceRejectsCaseVariantSCPURL(t *testing.T) {
 	}
 }
 
+// TestCredentialedWorkspaceRejectsTrailingDotHostname covers the absolute-DNS
+// form "github.com." (a valid, distinct hostname string that Git and DNS both
+// still treat as github.com): without normalizing it before comparison, a
+// repository on it would skip GitHub-specific validation entirely, letting an
+// unlisted repository or one with embedded credentials through.
+func TestCredentialedWorkspaceRejectsTrailingDotHostname(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com./org/private.git"}}}}
+
+	_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
+	if err == nil || !strings.Contains(err.Error(), "not listed") {
+		t.Fatalf("trailing-dot GitHub hostname was not validated: %v", err)
+	}
+}
+
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
 	workerIP         string
