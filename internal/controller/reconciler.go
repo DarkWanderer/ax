@@ -257,18 +257,35 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		}
 	}
 
+	// A lookup failure here (as opposed to the secret being authoritatively
+	// unconfigured) must not silently compute a credential-less template and
+	// switch an already-running actor to it -- see templateApplicable below.
+	var secretLookupErr error
 	if extraEnv[claudeAgentEnv] == claudeAgent {
 		if extraEnv["AX_CLAUDE_PROVIDER"] == openRouterProvider {
-			if openRouterKey := r.lookupSecret(ctx, atespace, openRouterSecretName, openRouterSecretKey); openRouterKey != "" {
+			openRouterKey, err := r.lookupSecret(ctx, atespace, openRouterSecretName, openRouterSecretKey)
+			secretLookupErr = err
+			if openRouterKey != "" {
 				extraEnv["ANTHROPIC_BASE_URL"] = "https://openrouter.ai/api"
 				extraEnv["ANTHROPIC_AUTH_TOKEN"] = openRouterKey
 				extraEnv[anthropicSecretKey] = ""
 			}
-		} else if anthropicKey := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey); anthropicKey != "" {
-			extraEnv[anthropicSecretKey] = anthropicKey
+		} else {
+			anthropicKey, err := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey)
+			secretLookupErr = err
+			if anthropicKey != "" {
+				extraEnv[anthropicSecretKey] = anthropicKey
+			}
 		}
-	} else if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
-		extraEnv[geminiSecretKey] = geminiKey
+	} else {
+		geminiKey, err := r.lookupGeminiKey(ctx, atespace)
+		secretLookupErr = err
+		if geminiKey != "" {
+			extraEnv[geminiSecretKey] = geminiKey
+		}
+	}
+	if secretLookupErr != nil {
+		slog.Warn("could not resolve task API key; leaving the actor's current template in place this round", "task", task.Metadata.GetName(), "error", secretLookupErr)
 	}
 
 	// Only launch configuration belongs in the template; status changes
@@ -350,8 +367,14 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	// was still missing for the non-credentialed case. Still gated on
 	// templateApplicable, so a round where the custom-template step was
 	// itself skipped doesn't compare the actor's real template against a
-	// stale default and "switch" it away from the correct one.
-	if templateApplicable && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
+	// stale default and "switch" it away from the correct one. Also gated on
+	// secretLookupErr == nil: a transient (not authoritative "unconfigured")
+	// secret-lookup failure must not switch an existing actor away from a
+	// template that may already have the credential this round couldn't
+	// resolve. This never affects first-time creation -- a freshly created
+	// actor's template already equals templateName, so the switch condition
+	// below is false for it regardless.
+	if templateApplicable && secretLookupErr == nil && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
 		// SetActorTemplate's contract only supports a suspended actor. A
 		// running actor (e.g. a non-credentialed resume whose secret rotated
 		// mid-flight) can't take the new template now; skip it here rather
@@ -726,30 +749,48 @@ func (r *TaskReconciler) setCondition(task *v1alpha1.Task, condType, status, rea
 
 // lookupGeminiKey resolves the Gemini API key for the task container, preferring the
 // Kubernetes secret in the task's atespace and falling back to the server's own
-// environment. It returns "" when neither source has a value.
-func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) string {
-	if key := r.lookupSecret(ctx, atespace, geminiSecretName, geminiSecretKey); key != "" {
-		return key
+// environment. It returns ("", nil) when neither source has a value, and a non-nil
+// error only when the secret lookup itself failed in a way that isn't an
+// authoritative "not configured" (see lookupSecret).
+func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) (string, error) {
+	key, err := r.lookupSecret(ctx, atespace, geminiSecretName, geminiSecretKey)
+	if err != nil {
+		return "", err
+	}
+	if key != "" {
+		return key, nil
 	}
 	if key := os.Getenv(geminiSecretKey); key != "" {
 		slog.Info("resolved GEMINI_API_KEY from server environment for actor template")
-		return key
+		return key, nil
 	}
-	return ""
+	return "", nil
 }
 
-func (r *TaskReconciler) lookupSecret(ctx context.Context, atespace, secretName, secretKey string) string {
+// lookupSecret resolves a secret key, returning ("", nil) when it is
+// authoritatively not configured (model.ErrSecretNotFound) and ("", err) for
+// any other lookup failure (network, auth, transient infra), so a caller
+// resuming an already-running actor can tell "genuinely unconfigured" (safe
+// to proceed without the key) apart from "couldn't tell this round" (unsafe
+// to recompute and switch away from a template that may already have it).
+func (r *TaskReconciler) lookupSecret(ctx context.Context, atespace, secretName, secretKey string) (string, error) {
 	if r.SecretResolver == nil {
-		return ""
+		return "", nil
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
 	defer cancel()
 	key, err := r.SecretResolver(lookupCtx, atespace, secretName, secretKey)
-	if err != nil || key == "" {
-		return ""
+	if err != nil {
+		if errors.Is(err, model.ErrSecretNotFound) {
+			return "", nil
+		}
+		return "", fmt.Errorf("looking up secret %s/%s: %w", atespace, secretName, err)
+	}
+	if key == "" {
+		return "", nil
 	}
 	slog.Info("resolved task API key from kubernetes secret for actor template", "atespace", atespace, "secret", secretName)
-	return key
+	return key, nil
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a

@@ -235,6 +235,68 @@ echo goal >> ` + events + `
 	}
 }
 
+// TestRun_SerializesGoalsForOverlappingPaths covers two bindings whose paths
+// are distinct but nested (one under the other): running their goals
+// concurrently would let two agents edit or delete the same underlying
+// files, since a descendant directory's contents are part of its ancestor's
+// filesystem tree too.
+func TestRun_SerializesGoalsForOverlappingPaths(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	// Records a start/end pair bracketing a sleep, identified by cwd (which
+	// the runner sets to the goal's workspace path), so the test can detect
+	// whether two goals' windows ever overlapped.
+	script := `#!/bin/sh
+echo "start $(pwd)" >> ` + events + `
+sleep 0.2
+echo "end $(pwd)" >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces, &v1alpha1.WorkspaceRef{
+		Name: "nested",
+		Path: filepath.Join(h.wsPath, "nested"),
+		Goal: "do something",
+	})
+	h.task.Spec.Command = []string{"true"}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("events file missing: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("got %d event lines, want 4 (start/end for each of 2 goals): %q", len(lines), lines)
+	}
+	open := 0
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "start "):
+			open++
+			if open > 1 {
+				t.Fatalf("goals overlapped: %q", lines)
+			}
+		case strings.HasPrefix(line, "end "):
+			open--
+		default:
+			t.Fatalf("unexpected event line: %q", line)
+		}
+	}
+}
+
 // TestRun_WorkspaceReadyDoesNotWaitForGoal covers /readyz?check=workspace: it
 // must report ready as soon as file setup finishes, independent of a
 // still-running goal. Goals can run far longer than the reconciler's own

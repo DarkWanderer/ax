@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -93,6 +94,18 @@ func resolveMounts(cfg Config) []mount {
 		mounts[i] = mount{ref: ref, ws: byName[ref.GetName()], path: paths[i]}
 	}
 	return mounts
+}
+
+// pathsOverlap reports whether two canonical, absolute paths are equal or
+// one is an ancestor directory of the other -- i.e. whether concurrent
+// filesystem operations under each could touch the same files.
+func pathsOverlap(a, b string) bool {
+	if a == b {
+		return true
+	}
+	aDir := strings.TrimSuffix(a, string(filepath.Separator)) + string(filepath.Separator)
+	bDir := strings.TrimSuffix(b, string(filepath.Separator)) + string(filepath.Separator)
+	return strings.HasPrefix(b, aDir) || strings.HasPrefix(a, bDir)
 }
 
 // CommandExit describes how the task command finished.
@@ -204,41 +217,70 @@ func Run(ctx context.Context, cfg Config) error {
 
 	// Goals need the network, which plain /readyz already unlocks
 	// independently of the workspace-specific flag above (see handleReadyz).
-	// Each workspace's goal runs concurrently with the others, but the
-	// task's own command -- which may depend on goal-driven setup, e.g. a
-	// repository the goal itself creates -- does not start until every goal
-	// has finished.
-	var goals sync.WaitGroup
-	// Two bindings can name the same directory without matching as strings
-	// (e.g. "/workspace/a" and "/workspace/./a"); RunGoal canonicalizes its
-	// path internally, so launching both concurrently would race on the same
-	// goal marker. Canonicalize here too, so only the first binding for a
-	// given real path gets a goal goroutine.
-	launchedGoalFor := make(map[string]bool, len(mounts))
+	// Goals whose paths don't overlap run concurrently with each other, but
+	// the task's own command -- which may depend on goal-driven setup, e.g.
+	// a repository the goal itself creates -- does not start until every
+	// goal has finished.
+	type goalRun struct {
+		path, goal, name string
+	}
+	// Bindings whose canonical paths are equal, or one an ancestor directory
+	// of the other, operate on overlapping (or the same) filesystem trees:
+	// running their goals concurrently would let two agents edit or delete
+	// the same files at once. Group such bindings into one serial queue;
+	// queues for non-overlapping paths still run concurrently with each
+	// other. Two bindings can also name the exact same directory without
+	// matching as strings (e.g. "/workspace/a" and "/workspace/./a");
+	// canonicalizing catches that as the equal-path case of overlap too.
+	var queues [][]goalRun
+	queueFor := make(map[string]int, len(mounts)) // canonical path -> index into queues
+	seenPath := make(map[string]bool, len(mounts))
 	for i, m := range mounts {
-		if goal := m.ref.GetGoal(); ready && goal != "" {
-			if legacyGoal[i] {
-				slog.Info("workspace goal already carried out by a pre-split runner; not repeating it", "workspace", m.ref.GetName(), "path", m.path)
-				workspace.MarkGoalHandledByLegacySetup(m.path)
-				continue
-			}
-			canon := m.path
-			if abs, err := filepath.Abs(canon); err == nil {
-				canon = abs
-			}
-			if launchedGoalFor[canon] {
-				slog.Warn("workspace goal skipped: another binding already targets this path", "workspace", m.ref.GetName(), "path", m.path)
-				continue
-			}
-			launchedGoalFor[canon] = true
-			goals.Add(1)
-			go func(path, goal, name string) {
-				defer goals.Done()
-				if workspace.RunGoal(ctx, path, goal) {
-					slog.Info("workspace goal completed", "workspace", name, "path", path)
-				}
-			}(m.path, goal, m.ref.GetName())
+		goal := m.ref.GetGoal()
+		if !ready || goal == "" {
+			continue
 		}
+		if legacyGoal[i] {
+			slog.Info("workspace goal already carried out by a pre-split runner; not repeating it", "workspace", m.ref.GetName(), "path", m.path)
+			workspace.MarkGoalHandledByLegacySetup(m.path)
+			continue
+		}
+		canon := m.path
+		if abs, err := filepath.Abs(canon); err == nil {
+			canon = abs
+		}
+		if seenPath[canon] {
+			slog.Warn("workspace goal skipped: another binding already targets this path", "workspace", m.ref.GetName(), "path", m.path)
+			continue
+		}
+		seenPath[canon] = true
+
+		run := goalRun{path: m.path, goal: goal, name: m.ref.GetName()}
+		placed := false
+		for existingCanon, qi := range queueFor {
+			if pathsOverlap(existingCanon, canon) {
+				queues[qi] = append(queues[qi], run)
+				queueFor[canon] = qi
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			queueFor[canon] = len(queues)
+			queues = append(queues, []goalRun{run})
+		}
+	}
+	var goals sync.WaitGroup
+	for _, queue := range queues {
+		goals.Add(1)
+		go func(queue []goalRun) {
+			defer goals.Done()
+			for _, run := range queue {
+				if workspace.RunGoal(ctx, run.path, run.goal) {
+					slog.Info("workspace goal completed", "workspace", run.name, "path", run.path)
+				}
+			}
+		}(queue)
 	}
 	goals.Wait()
 

@@ -297,6 +297,16 @@ func (c *Client) resolveAPIKey() string {
 	return ""
 }
 
+// ErrSecretNotFound is returned by GetKubernetesSecret when a lookup method
+// authoritatively reported the secret or key does not exist (e.g. a 404 from
+// the Kubernetes API, or kubectl's jsonpath coming back empty with no error).
+// A caller can use this to tell "not configured" (safe to treat as absent)
+// apart from a transient failure (network error, bad auth, decode failure),
+// which every lookup method here otherwise returns indistinguishably from
+// "not found" -- callers that would otherwise replace a working, previously
+// resolved credential need that distinction.
+var ErrSecretNotFound = errors.New("kubernetes secret not found")
+
 // GetKubernetesSecret retrieves a secret from the Kubernetes API or kubectl CLI.
 func GetKubernetesSecret(ctx context.Context, namespace, secretName, key string) (string, error) {
 	if secretName == "" || key == "" {
@@ -306,83 +316,115 @@ func GetKubernetesSecret(ctx context.Context, namespace, secretName, key string)
 		namespace = DefaultAtespace
 	}
 
+	var lastErr error
+
 	// 1. In-cluster Kubernetes API (inside pod)
-	if k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST"); k8sHost != "" {
-		k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
-		if k8sPort == "" {
-			k8sPort = "443"
-		}
-
-		tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
-		tokenData, err := os.ReadFile(tokenPath)
+	if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		val, err := getSecretFromKubernetesAPI(ctx, namespace, secretName, key)
 		if err == nil {
-			token := strings.TrimSpace(string(tokenData))
-
-			// If namespace was not specified, use pod's serviceaccount namespace
-			if namespace == "" {
-				if nsData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
-					if ns := strings.TrimSpace(string(nsData)); ns != "" {
-						namespace = ns
-					}
-				}
-			}
-
-			caCertPool := x509.NewCertPool()
-			if caData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"); err == nil {
-				caCertPool.AppendCertsFromPEM(caData)
-			}
-
-			tr := &http.Transport{
-				TLSClientConfig: &tls.Config{
-					RootCAs: caCertPool,
-				},
-			}
-			k8sClient := &http.Client{
-				Transport: tr,
-				Timeout:   10 * time.Second,
-			}
-
-			url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/secrets/%s", k8sHost, k8sPort, namespace, secretName)
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-			if err == nil {
-				req.Header.Set("Authorization", "Bearer "+token)
-				req.Header.Set("Accept", "application/json")
-				resp, err := k8sClient.Do(req)
-				if err == nil {
-					defer resp.Body.Close()
-					if resp.StatusCode == http.StatusOK {
-						var secretObj struct {
-							Data map[string]string `json:"data"`
-						}
-						if err := json.NewDecoder(resp.Body).Decode(&secretObj); err == nil {
-							if encoded, ok := secretObj.Data[key]; ok {
-								decoded, err := base64.StdEncoding.DecodeString(encoded)
-								if err == nil {
-									return strings.TrimSpace(string(decoded)), nil
-								}
-							}
-						}
-					}
-				}
-			}
+			return val, nil
 		}
+		lastErr = err
 	}
 
 	// 2. Fallback to kubectl CLI (for local development outside cluster)
 	cmd := exec.CommandContext(ctx, "kubectl", "get", "secret", secretName, "-n", namespace,
 		"-o", fmt.Sprintf("jsonpath={.data.%s}", key))
 	out, err := cmd.Output()
-	if err == nil {
+	if err != nil {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("kubectl get secret %s/%s: %w", namespace, secretName, err)
+		}
+	} else {
 		raw := strings.TrimSpace(string(out))
-		if raw != "" {
-			decoded, err := base64.StdEncoding.DecodeString(raw)
-			if err == nil {
-				return strings.TrimSpace(string(decoded)), nil
+		if raw == "" {
+			lastErr = fmt.Errorf("%w: %s/%s key %s", ErrSecretNotFound, namespace, secretName, key)
+		} else if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil {
+			return strings.TrimSpace(string(decoded)), nil
+		} else {
+			lastErr = fmt.Errorf("decoding kubernetes secret %s/%s key %s: %w", namespace, secretName, key, err)
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%w: %s/%s key %s", ErrSecretNotFound, namespace, secretName, key)
+	}
+	return "", lastErr
+}
+
+// getSecretFromKubernetesAPI reads a secret key via the in-cluster Kubernetes
+// API, using the pod's own service account. The returned error is
+// ErrSecretNotFound only for an authoritative "doesn't exist" (a 404, or the
+// key missing from the secret's data); every other failure (reading the
+// service account token, network, non-200/404 status, decode) gets its own
+// distinct error instead.
+func getSecretFromKubernetesAPI(ctx context.Context, namespace, secretName, key string) (string, error) {
+	k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if k8sPort == "" {
+		k8sPort = "443"
+	}
+
+	tokenData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return "", fmt.Errorf("reading service account token: %w", err)
+	}
+	token := strings.TrimSpace(string(tokenData))
+
+	// If namespace was not specified, use pod's serviceaccount namespace
+	if namespace == "" {
+		if nsData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+			if ns := strings.TrimSpace(string(nsData)); ns != "" {
+				namespace = ns
 			}
 		}
 	}
 
-	return "", fmt.Errorf("kubernetes secret %s/%s with key %s not found", namespace, secretName, key)
+	caCertPool := x509.NewCertPool()
+	if caData, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"); err == nil {
+		caCertPool.AppendCertsFromPEM(caData)
+	}
+
+	k8sClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caCertPool}},
+		Timeout:   10 * time.Second,
+	}
+
+	url := fmt.Sprintf("https://%s:%s/api/v1/namespaces/%s/secrets/%s", k8sHost, k8sPort, namespace, secretName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("building kubernetes API request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := k8sClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("querying kubernetes secret %s/%s: %w", namespace, secretName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("%w: %s/%s", ErrSecretNotFound, namespace, secretName)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("kubernetes secret %s/%s: unexpected status %d", namespace, secretName, resp.StatusCode)
+	}
+
+	var secretObj struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&secretObj); err != nil {
+		return "", fmt.Errorf("decoding kubernetes secret %s/%s: %w", namespace, secretName, err)
+	}
+	encoded, ok := secretObj.Data[key]
+	if !ok {
+		return "", fmt.Errorf("%w: key %q missing from %s/%s", ErrSecretNotFound, key, namespace, secretName)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decoding kubernetes secret %s/%s key %s: %w", namespace, secretName, key, err)
+	}
+	return strings.TrimSpace(string(decoded)), nil
 }
 
 // NewClientFromSpec creates a new model client from a v1alpha1.ModelSpec.

@@ -1721,6 +1721,67 @@ func TestClaudeSecretRotationDeferredWhileActorRunning(t *testing.T) {
 	}
 }
 
+// TestClaudeSecretTransientLookupFailurePreservesTemplate covers a suspended
+// Claude task resumed while its secret lookup transiently fails (as opposed
+// to the secret being authoritatively unconfigured): the reconciler must not
+// treat that failure as "no credential" and compute+switch to a new template
+// that lacks it, replacing a previously working one.
+func TestClaudeSecretTransientLookupFailurePreservesTemplate(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	calls := 0
+	reconciler.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "key-v1", nil
+		}
+		return "", errors.New("transient secret store error")
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "claude-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env:   []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+	// Create (suspended) with the secret lookup succeeding.
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	workingTemplate := mockSrv.actor.GetActorTemplate().GetName()
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+
+	// Reconcile again (still suspended) while the lookup now fails
+	// transiently.
+	got, err := reconciler.Reconcile(context.Background(), task, nil)
+	if err != nil {
+		t.Fatalf("Reconcile failed on a transient secret lookup error: %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+	if got := mockSrv.actor.GetActorTemplate().GetName(); got != workingTemplate {
+		t.Fatalf("actor's template = %q, want unchanged (%q) despite the transient lookup failure", got, workingTemplate)
+	}
+}
+
 func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
