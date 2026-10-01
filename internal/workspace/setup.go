@@ -524,18 +524,23 @@ const maxReadablePrefixBytes = 150
 // name, and a readable (if lossy) prefix is kept for a human skimming AXDir.
 // The full digest is kept, not truncated: workspace paths can come from task
 // specs, so a short digest lets a crafted path be brute-forced into
-// colliding with another workspace's marker.
+// colliding with another workspace's marker. The digest is taken over the
+// canonical path, before "root" is substituted for a trimmed-empty root --
+// hashing after that substitution would make "/" indistinguishable from any
+// other path that happens to trim to "root", such as "/root" itself.
 func sanitizePath(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
 	}
-	clean := strings.Trim(filepath.Clean(path), "/")
-	if clean == "" {
-		clean = "root"
+	canonical := filepath.Clean(path)
+	trimmed := strings.Trim(canonical, "/")
+	display := trimmed
+	if display == "" {
+		display = "root"
 	}
-	readable := strings.ReplaceAll(clean, "/", "-")
+	readable := strings.ReplaceAll(display, "/", "-")
 	readable = truncateUTF8(readable, maxReadablePrefixBytes)
-	sum := sha256.Sum256([]byte(clean))
+	sum := sha256.Sum256([]byte(canonical))
 	return readable + "-" + hex.EncodeToString(sum[:])
 }
 

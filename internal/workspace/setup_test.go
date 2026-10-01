@@ -303,6 +303,10 @@ func TestMarkerNameCollisionResistant(t *testing.T) {
 		{"/workspace/a-b", "/workspace/a/b"},
 		{"/a--b", "/a-/b"},
 		{"/workspace/a-/b", "/workspace/a/-b"},
+		// "/" trims to the same empty string that "root" substitutes for
+		// display, so hashing after that substitution would make these two
+		// distinct, valid paths indistinguishable.
+		{"/", "/root"},
 	}
 	for _, pair := range pairs {
 		a, b := workspace.MarkerName(pair[0]), workspace.MarkerName(pair[1])
