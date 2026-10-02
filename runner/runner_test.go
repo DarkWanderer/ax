@@ -366,12 +366,11 @@ echo "end $(pwd)" >> ` + events + `
 // TestRun_SerializesGoalsAcrossSymlinkedPaths covers two bindings where one
 // path is a symlink to the other's durable target: filepath.Abs only cleans a
 // path, it doesn't resolve symlinks, so without resolving them first the two
-// bindings would canonicalize to different strings, defeat the existing
-// same-path dedup, and run concurrently against what is actually the same
-// underlying filesystem tree. Once resolved, they canonicalize to the exact
-// same path and the existing dedup logic (seenPath) takes over: only the
-// first binding's goal runs, which is even safer than serializing a goal
-// against itself.
+// bindings would canonicalize to different strings and run concurrently
+// against what is actually the same underlying filesystem tree. The API
+// doesn't require the two bindings' goals to match, so once resolved to the
+// same canonical path they must both still run, serialized in one queue, not
+// have the later one silently dropped as if it were a plain duplicate.
 func TestRun_SerializesGoalsAcrossSymlinkedPaths(t *testing.T) {
 	t.Setenv("AX_GOAL_AGENT", "claude")
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")
@@ -399,7 +398,7 @@ echo "end $(pwd)" >> ` + events + `
 	}
 	h.task.Spec.Workspaces[0] = &v1alpha1.WorkspaceRef{Name: "real", Path: realPath, Goal: "do something"}
 	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces,
-		&v1alpha1.WorkspaceRef{Name: "link", Path: linkPath, Goal: "do something"})
+		&v1alpha1.WorkspaceRef{Name: "link", Path: linkPath, Goal: "do something else"})
 	h.task.Spec.Command = []string{"true"}
 
 	exit := h.runUntilCommandExits(t)
@@ -412,11 +411,22 @@ echo "end $(pwd)" >> ` + events + `
 		t.Fatalf("events file missing: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("got %d event lines, want 2 (start/end for a single goal run, the symlinked binding deduped away): %q", len(lines), lines)
+	if len(lines) != 4 {
+		t.Fatalf("got %d event lines, want 4 (start/end for each of 2 goals, neither dropped): %q", len(lines), lines)
 	}
-	if !strings.HasPrefix(lines[0], "start ") || !strings.HasPrefix(lines[1], "end ") {
-		t.Fatalf("unexpected event lines: %q", lines)
+	open := 0
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "start "):
+			open++
+			if open > 1 {
+				t.Fatalf("goals overlapped: %q", lines)
+			}
+		case strings.HasPrefix(line, "end "):
+			open--
+		default:
+			t.Fatalf("unexpected event line: %q", line)
+		}
 	}
 }
 

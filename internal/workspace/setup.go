@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -468,6 +469,21 @@ func runClaudeBootstrap(ctx context.Context, goal, targetPath string) (ran bool,
 	cmd.Stdin = strings.NewReader(goal)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Claude's allowed Bash tool can leave its own child processes running
+	// when this timeout fires: exec.CommandContext's default cancellation
+	// only kills the claude process itself, not any descendants, so an
+	// in-flight tool subprocess would be orphaned and keep running --
+	// potentially still modifying this workspace -- after RunGoal returns and
+	// the task command starts. Running claude in its own process group and
+	// killing that whole group on cancellation takes its descendants down
+	// with it.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			slog.Warn("Claude workspace goal timed out", "timeout", timeout)
@@ -505,21 +521,28 @@ func MarkerName(path string) string {
 // legacyMarkerName returns the marker name a runner from before per-path
 // marker names included a digest would have used for path, so a workspace it
 // already initialized is still recognized as such. It returns "" when path is
-// ambiguous under that pre-digest scheme: that scheme substituted "-" for
-// every "/", so when a path segment itself contains a literal "-" (e.g.
-// "/workspace/a-b"), its flattened name collides with a distinct path that
-// has a "/" in that same position instead (e.g. "/workspace/a/b") -- both
-// flatten to "a-b". A legacy marker actually written for one such path must
-// not be mistaken for proof that a different, colliding path was already
-// initialized, so callers must treat "" as "no legacy name to check" rather
-// than a literal empty marker file name.
+// ambiguous under that pre-digest scheme, in either of two ways:
+//
+//   - That scheme substituted "-" for every "/", so when a path segment
+//     itself contains a literal "-" (e.g. "/workspace/a-b"), its flattened
+//     name collides with a distinct path that has a "/" in that same
+//     position instead (e.g. "/workspace/a/b") -- both flatten to "a-b".
+//   - The scheme also substitutes the literal name "root" for the true root
+//     path "/" (since trimming "/" leaves an empty string), which collides
+//     with any sibling path that happens to be named "/root" (or, from a
+//     relative path, just "root") -- both produce "initialized-root".
+//
+// A legacy marker actually written for one such path must not be mistaken for
+// proof that a different, colliding path was already initialized, so callers
+// must treat "" as "no legacy name to check" rather than a literal empty
+// marker file name.
 func legacyMarkerName(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
 	}
 	clean := strings.Trim(filepath.Clean(path), "/")
-	if clean == "" {
-		clean = "root"
+	if clean == "" || clean == "root" {
+		return ""
 	}
 	if strings.Contains(clean, "-") {
 		return ""

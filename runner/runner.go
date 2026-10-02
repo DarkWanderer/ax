@@ -235,9 +235,13 @@ func Run(ctx context.Context, cfg Config) error {
 	// canonToRun holds, in encounter order, each eligible goal keyed by its
 	// canonical path; canonOrder preserves that order for deterministic queue
 	// assignment below.
-	canonToRun := make(map[string]goalRun, len(mounts))
+	// canonToRuns holds every eligible goal for a canonical path, in
+	// encounter order: two bindings that alias the same physical directory
+	// (e.g. through a symlink) can still specify different goals, so the
+	// later one must be queued behind the first, not silently dropped as a
+	// duplicate.
+	canonToRuns := make(map[string][]goalRun, len(mounts))
 	var canonOrder []string
-	seenPath := make(map[string]bool, len(mounts))
 	for i, m := range mounts {
 		goal := m.ref.GetGoal()
 		if !ready || goal == "" {
@@ -264,13 +268,10 @@ func Run(ctx context.Context, cfg Config) error {
 		if resolved, err := filepath.EvalSymlinks(canon); err == nil {
 			canon = resolved
 		}
-		if seenPath[canon] {
-			slog.Warn("workspace goal skipped: another binding already targets this path", "workspace", m.ref.GetName(), "path", m.path)
-			continue
+		if _, seen := canonToRuns[canon]; !seen {
+			canonOrder = append(canonOrder, canon)
 		}
-		seenPath[canon] = true
-		canonToRun[canon] = goalRun{path: m.path, goal: goal, name: m.ref.GetName()}
-		canonOrder = append(canonOrder, canon)
+		canonToRuns[canon] = append(canonToRuns[canon], goalRun{path: m.path, goal: goal, name: m.ref.GetName()})
 	}
 	// Overlap isn't transitive as a pairwise check (A-B and B-C overlapping
 	// doesn't mean A-C do), so a path overlapping two previously-separate
@@ -310,7 +311,7 @@ func Run(ctx context.Context, cfg Config) error {
 			queueIndex[root] = qi
 			queues = append(queues, nil)
 		}
-		queues[qi] = append(queues[qi], canonToRun[c])
+		queues[qi] = append(queues[qi], canonToRuns[c]...)
 	}
 	var goals sync.WaitGroup
 	for _, queue := range queues {

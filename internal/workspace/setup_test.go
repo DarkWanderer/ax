@@ -497,6 +497,32 @@ func TestGoalPredatesSplit_AmbiguousLegacyMarkerNameNotTrusted(t *testing.T) {
 	}
 }
 
+// TestGoalPredatesSplit_RootSentinelLegacyMarkerNameNotTrusted covers another
+// collision in the pre-digest legacy scheme, distinct from a literal "-" in a
+// path segment: trimming the true root path "/" leaves an empty string, which
+// the scheme substitutes the literal name "root" for -- the exact same name a
+// sibling path of "/root" would itself trim to. A legacy marker actually
+// written for one must not be mistaken for proof that the other was already
+// initialized.
+func TestGoalPredatesSplit_RootSentinelLegacyMarkerNameNotTrusted(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+
+	// A legacy marker at the name both "/" and "/root" flatten to (written,
+	// in this scenario, for "/root").
+	if err := os.WriteFile(filepath.Join(stateDir, "initialized-root"), []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// "/" must not trust that marker as proof of its own prior
+	// initialization: it may really belong to the colliding "/root".
+	if workspace.GoalPredatesSplit("/") {
+		t.Fatal("a root-sentinel legacy marker name ambiguous with /root was trusted for /")
+	}
+}
+
 func TestMarkGoalHandledByLegacySetup(t *testing.T) {
 	stateDir := t.TempDir()
 	origAXDir := workspace.AXDir
@@ -543,6 +569,48 @@ IFS= read -r prompt || true
 	content, err := os.ReadFile(marker)
 	if err != nil || !strings.Contains(string(content), "goal: create greeting") {
 		t.Fatalf("goal marker missing or incorrect: %v", err)
+	}
+}
+
+// TestRunGoalClaude_KillsToolSubprocessOnTimeout covers AX_BOOTSTRAP_TIMEOUT
+// firing while one of Claude's allowed Bash tools still has a child process
+// running: exec.CommandContext's default cancellation kills only the claude
+// process itself, leaving such a child orphaned and able to keep modifying
+// the workspace (or otherwise running) well after RunGoal returns. claude
+// must run in its own process group so the whole group, including any such
+// child, is killed on timeout.
+func TestRunGoalClaude_KillsToolSubprocessOnTimeout(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "300ms")
+	bin := t.TempDir()
+	childMarker := filepath.Join(t.TempDir(), "child-completed")
+	// Simulates claude leaving a Bash-tool child process running (sleeping
+	// longer than the bootstrap timeout) while claude itself also hangs past
+	// the timeout.
+	script := `#!/bin/sh
+(sleep 2; echo done > ` + childMarker + `) &
+sleep 10
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	path := t.TempDir()
+
+	if workspace.RunGoal(context.Background(), path, "do something") {
+		t.Fatal("RunGoal reported success for a goal that timed out")
+	}
+
+	// Give the child process (sleeping 2s) ample time to have written its
+	// marker, were it not killed along with claude's process group.
+	time.Sleep(3 * time.Second)
+	if _, err := os.Stat(childMarker); err == nil {
+		t.Fatal("tool subprocess survived claude's timeout and kept running")
 	}
 }
 
