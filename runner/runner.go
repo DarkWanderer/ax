@@ -252,6 +252,18 @@ func Run(ctx context.Context, cfg Config) error {
 		if abs, err := filepath.Abs(canon); err == nil {
 			canon = abs
 		}
+		// filepath.Abs only cleans the path; it doesn't resolve symlinks, so a
+		// workspace bound at "/workspace/link" (symlinked to the durable
+		// "/workspace/real", itself also separately bound) would otherwise
+		// canonicalize to a different string than "/workspace/real" and be
+		// treated as non-overlapping, letting both goals run concurrently
+		// against the same underlying filesystem tree. PrepareWorkspace above
+		// has already created or confirmed every path in mounts, so resolving
+		// here is safe; a path that still can't be resolved (e.g. a dangling
+		// symlink) just falls back to the Abs form.
+		if resolved, err := filepath.EvalSymlinks(canon); err == nil {
+			canon = resolved
+		}
 		if seenPath[canon] {
 			slog.Warn("workspace goal skipped: another binding already targets this path", "workspace", m.ref.GetName(), "path", m.path)
 			continue

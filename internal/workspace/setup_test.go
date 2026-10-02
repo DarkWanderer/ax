@@ -458,6 +458,45 @@ func TestGoalPredatesSplit_LegacyMarkerName(t *testing.T) {
 	}
 }
 
+// TestGoalPredatesSplit_AmbiguousLegacyMarkerNameNotTrusted covers the
+// pre-digest legacy scheme's inherent ambiguity: it substitutes "-" for every
+// "/", so "/base/a-b" and "/base/a/b" both flatten to the same legacy marker
+// name. A legacy marker at that name could actually have been written for
+// either path, so a path whose own segments contain a literal "-" (like
+// "/base/a-b") must not trust a same-named legacy marker as proof that IT was
+// already initialized -- it may really belong to the distinct, slash-separated
+// path it collides with.
+func TestGoalPredatesSplit_AmbiguousLegacyMarkerNameNotTrusted(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	base := t.TempDir()
+
+	hyphenPath := filepath.Join(base, "a-b")
+	slashPath := filepath.Join(base, "a", "b")
+
+	// A legacy marker at the name both hyphenPath and slashPath flatten to
+	// (written, in this scenario, for slashPath).
+	legacyName := "initialized-" + strings.ReplaceAll(strings.Trim(slashPath, "/"), "/", "-")
+	if err := os.WriteFile(filepath.Join(stateDir, legacyName), []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// hyphenPath must not trust that marker as proof of its own prior
+	// initialization: it may really belong to the colliding slashPath.
+	if workspace.GoalPredatesSplit(hyphenPath) {
+		t.Fatal("a legacy marker name ambiguous with another path was trusted")
+	}
+	res, err := workspace.PrepareWorkspace(context.Background(), nil, hyphenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsMaidenRun {
+		t.Fatal("a path whose legacy marker name is ambiguous with another path skipped its maiden run")
+	}
+}
+
 func TestMarkGoalHandledByLegacySetup(t *testing.T) {
 	stateDir := t.TempDir()
 	origAXDir := workspace.AXDir

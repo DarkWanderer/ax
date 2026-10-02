@@ -147,10 +147,14 @@ func prepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath st
 	}
 	// A workspace already initialized by a runner from before per-path marker
 	// names included a digest: its marker is invisible at markerPath above, so
-	// check the pre-digest name too before treating this as a maiden run.
-	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
-		slog.Info("workspace already initialized (legacy marker); skipping maiden run setup", "path", targetPath)
-		return res, nil
+	// check the pre-digest name too before treating this as a maiden run. An
+	// empty legacy name means that name would be ambiguous with another,
+	// distinct path (see legacyMarkerName), so it must not be trusted here.
+	if legacyName := legacyMarkerName(targetPath); legacyName != "" {
+		if _, err := os.Stat(filepath.Join(AXDir, legacyName)); err == nil {
+			slog.Info("workspace already initialized (legacy marker); skipping maiden run setup", "path", targetPath)
+			return res, nil
+		}
 	}
 
 	slog.Info("executing workspace maiden run setup", "path", targetPath)
@@ -500,7 +504,15 @@ func MarkerName(path string) string {
 
 // legacyMarkerName returns the marker name a runner from before per-path
 // marker names included a digest would have used for path, so a workspace it
-// already initialized is still recognized as such.
+// already initialized is still recognized as such. It returns "" when path is
+// ambiguous under that pre-digest scheme: that scheme substituted "-" for
+// every "/", so when a path segment itself contains a literal "-" (e.g.
+// "/workspace/a-b"), its flattened name collides with a distinct path that
+// has a "/" in that same position instead (e.g. "/workspace/a/b") -- both
+// flatten to "a-b". A legacy marker actually written for one such path must
+// not be mistaken for proof that a different, colliding path was already
+// initialized, so callers must treat "" as "no legacy name to check" rather
+// than a literal empty marker file name.
 func legacyMarkerName(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
@@ -508,6 +520,9 @@ func legacyMarkerName(path string) string {
 	clean := strings.Trim(filepath.Clean(path), "/")
 	if clean == "" {
 		clean = "root"
+	}
+	if strings.Contains(clean, "-") {
+		return ""
 	}
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
 }
@@ -586,9 +601,13 @@ func GoalPredatesSplit(targetPath string) bool {
 	}
 	// A marker at the pre-digest legacy name can only have been written by a
 	// runner that predates this whole marker-naming scheme, and so predates
-	// the goal split too, regardless of its content.
-	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
-		return true
+	// the goal split too, regardless of its content. An empty legacy name
+	// means that name would be ambiguous with another, distinct path (see
+	// legacyMarkerName), so it must not be trusted here.
+	if legacyName := legacyMarkerName(targetPath); legacyName != "" {
+		if _, err := os.Stat(filepath.Join(AXDir, legacyName)); err == nil {
+			return true
+		}
 	}
 	data, err := os.ReadFile(filepath.Join(AXDir, MarkerName(targetPath)))
 	if err != nil {
