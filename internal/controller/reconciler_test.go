@@ -227,6 +227,74 @@ func TestCredentialedTaskCreatedSuspendedRevokesUnusedToken(t *testing.T) {
 	}
 }
 
+// revokeCtxCapturingTokens wraps fakeInstallationTokens to record the exact
+// context.Context passed to each Revoke call, so a test can tell whether
+// production code reused the caller's own context or, as it must for a
+// cleanup revoke, built a fresh one instead.
+type revokeCtxCapturingTokens struct {
+	fakeInstallationTokens
+	revokeCtxs []context.Context
+}
+
+func (c *revokeCtxCapturingTokens) Revoke(ctx context.Context, token string) error {
+	c.revokeCtxs = append(c.revokeCtxs, ctx)
+	return c.fakeInstallationTokens.Revoke(ctx, token)
+}
+
+type callerCtxKey struct{}
+
+// TestCredentialedTaskCreatedSuspendedRevokesWithFreshContext covers a
+// credentialed CreateTask that starts out suspended: the token minted for
+// its (never-run) actor is revoked right after SuspendActor succeeds. If that
+// revoke reused the caller's own request context -- which may be close to
+// its deadline right after a real Substrate SuspendActor call, itself
+// possibly slow -- losing it to a now-exhausted context would report the
+// whole call failed, with the task record never created, even though the
+// actor really is suspended and the token is the only thing left live. The
+// revoke must use its own fresh, independently bounded context instead, the
+// same way suspendAndRevoke already does for its own revoke.
+func TestCredentialedTaskCreatedSuspendedRevokesWithFreshContext(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	tokens := &revokeCtxCapturingTokens{}
+	r.InstallationTokens = tokens
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+
+	ctx := context.WithValue(context.Background(), callerCtxKey{}, "caller")
+	got, err := r.ReconcileWithProvider(ctx, task, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+	if len(tokens.revokeCtxs) != 1 {
+		t.Fatalf("revoked %d times, want 1", len(tokens.revokeCtxs))
+	}
+	if tokens.revokeCtxs[0].Value(callerCtxKey{}) != nil {
+		t.Fatal("revoke used the caller's own context instead of a fresh, independently bounded one")
+	}
+	if _, ok := tokens.revokeCtxs[0].Deadline(); !ok {
+		t.Fatal("revoke's context has no deadline; want it bounded like suspendAndRevoke's cleanup context")
+	}
+}
+
 // TestCredentialedCreateDoesNotRevokeOnFailedSuspend covers a fresh,
 // credentialed actor whose initial SuspendActor call fails: the actor may
 // still be running with the just-minted token, so it must not be revoked
@@ -782,6 +850,9 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 	m.suspendedActors = append(m.suspendedActors, name)
 	if m.actor != nil {
 		m.actor.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	}
+	if m.onSuspendActor != nil {
+		m.onSuspendActor()
 	}
 	return &ateapipb.SuspendActorResponse{}, nil
 }

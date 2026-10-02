@@ -183,8 +183,14 @@ func Run(ctx context.Context, cfg Config) error {
 		legacyGoal[i] = workspace.GoalPredatesSplit(m.path)
 	}
 
+	// prepared tracks each mount's own setup outcome, independent of the
+	// others': one workspace's hard preparation error must not also cancel
+	// the goal that another, successfully-prepared workspace is still owed
+	// below (see the goal-launching loop's use of prepared[i] rather than the
+	// aggregate ready).
+	prepared := make([]bool, len(mounts))
 	ready := true
-	for _, m := range mounts {
+	for i, m := range mounts {
 		var err error
 		if cfg.Task.GetSpec().GetCredentialProvider() != nil {
 			_, err = workspace.PrepareWorkspaceStrict(ctx, m.ws, m.path)
@@ -199,7 +205,9 @@ func Run(ctx context.Context, cfg Config) error {
 				return fmt.Errorf("credentialed workspace setup failed: %w", err)
 			}
 			ready = false
+			continue
 		}
+		prepared[i] = true
 	}
 	// WorkspaceReady is reported as soon as file setup finishes, not after
 	// goals too: goals can run far longer than the reconciler's own
@@ -244,7 +252,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var canonOrder []string
 	for i, m := range mounts {
 		goal := m.ref.GetGoal()
-		if !ready || goal == "" {
+		if !prepared[i] || goal == "" {
 			continue
 		}
 		if legacyGoal[i] {

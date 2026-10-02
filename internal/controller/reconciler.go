@@ -414,8 +414,17 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		}
 		// A credentialed task that starts out suspended still minted a token above
 		// for the eventual resume; it must not sit valid on an actor that never ran.
+		// A fresh, independently bounded context for the revoke: ctx may be close
+		// to its deadline after SuspendActor above (which can itself run long),
+		// and the actor is confirmed suspended at this point regardless -- losing
+		// the revoke to a now-exhausted ctx would report this call failed and the
+		// task record never created, even though the token is the only thing left
+		// live, with no SuspendActor failure path above to have already reported it.
 		if provider != nil && newToken != "" {
-			if err := r.InstallationTokens.Revoke(ctx, newToken); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+			err := r.InstallationTokens.Revoke(cleanupCtx, newToken)
+			cancel()
+			if err != nil {
 				return r.credentialFailure(task, fmt.Sprintf("could not revoke installation token: %v", err), now)
 			}
 		}

@@ -195,6 +195,53 @@ echo goal >> ` + events + `
 	}
 }
 
+// TestRun_RunsGoalForWorkspaceThatPreparedSuccessfully covers multiple
+// non-credentialed bindings where one's setup hard-fails (its path collides
+// with an existing plain file, so MkdirAll can't create a directory there):
+// that failure must not also cancel the goal owed to a different binding
+// that prepared successfully, even though the task overall is no longer
+// reported workspace-ready.
+func TestRun_RunsGoalForWorkspaceThatPreparedSuccessfully(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+echo goal >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	// A plain file where a workspace binding expects to create a directory:
+	// os.MkdirAll fails on it, forcing a hard preparation error for just this
+	// one binding.
+	brokenPath := filepath.Join(filepath.Dir(h.wsPath), "broken")
+	if err := os.WriteFile(brokenPath, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces,
+		&v1alpha1.WorkspaceRef{Name: "broken", Path: brokenPath})
+	h.task.Spec.Workspaces[0].Goal = "do something"
+	h.task.Spec.Command = []string{"true"}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("goal for the successfully-prepared workspace did not run: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "goal" {
+		t.Errorf("events = %q, want exactly one goal run", got)
+	}
+}
+
 func TestRun_SkipsGoalForCanonicalDuplicatePath(t *testing.T) {
 	t.Setenv("AX_GOAL_AGENT", "claude")
 	t.Setenv("ANTHROPIC_API_KEY", "test-key")
