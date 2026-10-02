@@ -641,6 +641,94 @@ func TestCredentialedWorkspaceFailureFailsTask(t *testing.T) {
 	}
 }
 
+// TestCredentialedWorkspaceFailureRetriesCleanupOnTransientError covers a
+// workspace that reports failure (HTTP 424) while the cleanup step itself
+// (here, GetActor) fails transiently: with no background reconciliation to
+// pick this up later, a single failed cleanup attempt would otherwise leave
+// the actor running indefinitely with a live installation token. The cleanup
+// must retry rather than give up on the first failure.
+func TestCredentialedWorkspaceFailureRetriesCleanupOnTransientError(t *testing.T) {
+	ready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusFailedDependency) }))
+	defer ready.Close()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{workerIP: strings.TrimPrefix(ready.URL, "http://")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.CleanupRetryDelay = time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "key" {
+			return "private-key", nil
+		}
+		return "", nil
+	}
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+
+	// Create (suspended) first, with the mock's normal GetActor behavior, so
+	// the actor genuinely exists before the resume below -- only the resume's
+	// own cleanup-path GetActor calls should see the injected failures.
+	createTask := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+	if _, err := r.ReconcileWithProvider(context.Background(), createTask, provider); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// GetActor fails transiently on its first two calls from here on (the
+	// cleanup path's own calls), then succeeds from the third attempt onward.
+	// The resume's own reconcile logic makes two legitimate GetActor calls of
+	// its own before ever reaching the 424-triggered cleanup path; only the
+	// cleanup path's calls (the third GetActor call onward) are made to fail
+	// transiently, twice, before succeeding.
+	const legitimateCallsBeforeCleanup = 2
+	getActorCalls := 0
+	cleanupGetActorCalls := 0
+	mock.getActorFunc = func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+		getActorCalls++
+		name := req.GetActor().GetName()
+		fetch := func() (*ateapipb.Actor, error) {
+			if mock.actor != nil && mock.actor.GetMetadata().GetName() == name {
+				return mock.actor, nil
+			}
+			return nil, status.Errorf(codes.NotFound, "actor %q not found", name)
+		}
+		if getActorCalls <= legitimateCallsBeforeCleanup {
+			return fetch()
+		}
+		cleanupGetActorCalls++
+		if cleanupGetActorCalls < 3 {
+			return nil, status.Errorf(codes.Unavailable, "transient control plane error")
+		}
+		return fetch()
+	}
+
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Phase: "Running"}}
+	got, err := r.ReconcileWithProvider(context.Background(), task, provider)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("failed workspace was not reported: task=%v err=%v", got, err)
+	}
+	if cleanupGetActorCalls < 3 {
+		t.Fatalf("cleanup gave up after %d GetActor attempts, want it to retry through the transient failures", cleanupGetActorCalls)
+	}
+	// suspendedActors has one entry from the initial create-and-suspend round
+	// plus one more from this round's cleanup succeeding on its third attempt;
+	// what matters is that it recorded a second suspend at all, rather than
+	// giving up after the first two cleanup attempts failed.
+	if len(mock.suspendedActors) != 2 {
+		t.Fatalf("suspendedActors=%v, want a second suspend recorded once cleanup succeeded on retry", mock.suspendedActors)
+	}
+}
+
 // TestCredentialedWorkspaceRejectsCaseVariantSCPURL covers a valid Git SCP-style
 // GitHub URL spelled with a different host case (git@GitHub.com:...): it must
 // still be rejected as needing HTTPS, not silently pass validation by going
@@ -1964,6 +2052,20 @@ func TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure(t *
 	}
 	if gotToken != "ghs_test_token_2" {
 		t.Fatalf("actor's current template carries GITHUB_TOKEN=%q, want the freshly minted ghs_test_token_2 (not the revoked token)", gotToken)
+	}
+	// The new template must also carry forward the last successfully-resolved
+	// model credential: this round's own lookup failed, so without carrying
+	// it forward the actor would resume into a template with a valid GitHub
+	// token but no Claude credential at all, and the workspace goal would
+	// then be skipped for lack of credentials.
+	var gotModelKey string
+	for _, e := range tmpl.GetContainers()[0].GetEnv() {
+		if e.GetName() == "ANTHROPIC_API_KEY" {
+			gotModelKey = e.GetValue()
+		}
+	}
+	if gotModelKey != "claude-key-v1" {
+		t.Fatalf("actor's current template carries ANTHROPIC_API_KEY=%q, want the last successfully-resolved %q carried forward", gotModelKey, "claude-key-v1")
 	}
 }
 

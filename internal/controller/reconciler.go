@@ -67,6 +67,13 @@ const (
 	// only copy of a freshly minted token must not be skipped just because the
 	// caller's context is now dead.
 	cleanupRevokeTimeout = 5 * time.Second
+	// workspaceFailureCleanupAttempts bounds the retries for suspending and
+	// revoking an actor after its workspace setup reports failure: with no
+	// background reconciliation loop, a single transient failure here (a busy
+	// control plane, a momentary network blip) would otherwise leave the
+	// actor running indefinitely with a live installation token.
+	workspaceFailureCleanupAttempts = 3
+	workspaceFailureCleanupDelay    = 2 * time.Second
 )
 
 // SecretResolver looks up a key from a Kubernetes secret in the given namespace.
@@ -93,6 +100,11 @@ type TaskReconciler struct {
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
+
+	// CleanupRetryDelay is the delay between retries in
+	// suspendAndRevokeWithRetry. It defaults to workspaceFailureCleanupDelay;
+	// tests shorten it so a retried cleanup doesn't slow down the suite.
+	CleanupRetryDelay time.Duration
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -111,6 +123,7 @@ func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplat
 		SecretResolver:          model.GetKubernetesSecret,
 		InstallationTokens:      &credentials.GitHubClient{},
 		WorkspaceReadyTimeout:   defaultWorkspaceReadyTimeout,
+		CleanupRetryDelay:       workspaceFailureCleanupDelay,
 	}
 }
 
@@ -286,6 +299,27 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	}
 	if secretLookupErr != nil {
 		slog.Warn("could not resolve task API key; leaving the actor's current template in place this round", "task", task.Metadata.GetName(), "error", secretLookupErr)
+		// A GitHub token rotation (newToken != "") still forces a template
+		// switch below despite this failure, to avoid leaving the actor on a
+		// template whose GitHub credential was just revoked (see the switch
+		// condition's own comment). That replacement template is otherwise
+		// built from extraEnv as of right now, which is missing the model
+		// credential this round's lookup couldn't resolve -- carrying the
+		// previous template's own model credential forward keeps the new
+		// template complete, instead of resuming the actor into a workspace
+		// goal that can't run for lack of credentials while WorkspaceReady may
+		// already be stuck true from an earlier round.
+		if newToken != "" && existingActor != nil {
+			if oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName()); err == nil {
+				for _, key := range []string{anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey} {
+					if extraEnv[key] == "" {
+						if v := templateEnvValue(oldTmpl, key); v != "" {
+							extraEnv[key] = v
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Only launch configuration belongs in the template; status changes
@@ -548,10 +582,8 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 DonePolling:
 	if workspaceFailed {
 		failNow := time.Now()
-		if actor, err := r.client.GetActor(ctx, atespace, actorName); err == nil {
-			if suspendErr := r.suspendAndRevoke(ctx, atespace, actorName, actor); suspendErr != nil {
-				slog.Warn("could not suspend and revoke actor after workspace failure", "actor", actorName, "error", suspendErr)
-			}
+		if err := r.suspendAndRevokeWithRetry(atespace, actorName); err != nil {
+			slog.Error("could not suspend and revoke actor after workspace failure; actor may still be running with a live installation token and needs manual cleanup", "actor", actorName, "error", err)
 		}
 		return r.credentialFailure(task, "credentialed workspace setup failed", failNow)
 	}
@@ -660,6 +692,36 @@ func (r *TaskReconciler) suspendAndRevoke(ctx context.Context, atespace, actorNa
 	return nil
 }
 
+// suspendAndRevokeWithRetry re-reads the actor and retries suspendAndRevoke a
+// few times, so a transient failure in GetActor, SuspendActor, the template
+// lookup, or the revoke itself doesn't immediately strand a credentialed
+// actor running with a live installation token: there is no background
+// reconciliation to pick this up later (see the reconcile loop's own
+// WorkspaceReadyTimeout comment), so this call is the only chance to clean up
+// before the task is reported Failed. Each attempt re-reads the actor rather
+// than reusing a stale one, since a GetActor failure is itself one of the
+// steps being retried.
+func (r *TaskReconciler) suspendAndRevokeWithRetry(atespace, actorName string) error {
+	var lastErr error
+	for attempt := 1; attempt <= workspaceFailureCleanupAttempts; attempt++ {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+		actor, err := r.client.GetActor(cleanupCtx, atespace, actorName)
+		if err == nil {
+			err = r.suspendAndRevoke(cleanupCtx, atespace, actorName, actor)
+		}
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < workspaceFailureCleanupAttempts {
+			slog.Warn("cleanup attempt failed after workspace failure; retrying", "actor", actorName, "attempt", attempt, "error", err)
+			time.Sleep(r.CleanupRetryDelay)
+		}
+	}
+	return lastErr
+}
+
 func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, workspaces []*v1alpha1.Workspace) error {
 	allowed := make(map[string]bool)
 	for _, name := range provider.GetSpec().GetGithubApp().GetRepositories() {
@@ -720,9 +782,15 @@ func (r *TaskReconciler) actorToken(ctx context.Context, actor *ateapipb.Actor) 
 // templateToken extracts the GITHUB_TOKEN baked into an ActorTemplate's
 // container environment, or "" if it has none.
 func templateToken(tmpl *ateapipb.ActorTemplate) string {
+	return templateEnvValue(tmpl, "GITHUB_TOKEN")
+}
+
+// templateEnvValue extracts a named container env var from an ActorTemplate,
+// or "" if it has none.
+func templateEnvValue(tmpl *ateapipb.ActorTemplate, name string) string {
 	for _, container := range tmpl.GetContainers() {
 		for _, env := range container.GetEnv() {
-			if env.GetName() == "GITHUB_TOKEN" {
+			if env.GetName() == name {
 				return env.GetValue()
 			}
 		}

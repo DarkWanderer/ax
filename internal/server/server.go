@@ -173,6 +173,22 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	}
 	defer unlock()
 
+	// Hold the credential provider's own lock from here through reconciliation
+	// (which may mint a token from its current repository and permission
+	// scope): acquiring it any later -- e.g. only around reconcile, after the
+	// task is already saved below -- would leave a window where a concurrent
+	// DeleteCredentialProvider or a restrictive UpdateCredentialProvider could
+	// complete first, and would also mean a failed lock attempt arrives after
+	// SaveTask has already persisted an immutable task record that this
+	// now-failed call can never go back and reconcile.
+	if ref := task.GetSpec().GetCredentialProvider(); ref != nil {
+		unlockProvider, err := s.locker.Lock(ctx, "credentialprovider", atespace, ref.GetName())
+		if err != nil {
+			return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, ref.GetName(), err)
+		}
+		defer unlockProvider()
+	}
+
 	_, err = s.store.GetTask(ctx, atespace, taskName)
 	if err == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "task %s/%s already exists and is immutable", atespace, taskName)
@@ -203,20 +219,6 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
-		// Hold the credential provider's own lock across both reading it and
-		// reconciling (which may mint a token from its current repository and
-		// permission scope): without this, a concurrent DeleteCredentialProvider
-		// or a restrictive UpdateCredentialProvider could acquire that lock,
-		// report success, and have the deletion or scope reduction complete
-		// while this call is still minting a token against the stale object it
-		// already read.
-		if ref := task.GetSpec().GetCredentialProvider(); ref != nil {
-			unlockProvider, err := s.locker.Lock(ctx, "credentialprovider", atespace, ref.GetName())
-			if err != nil {
-				return nil, status.Errorf(codes.Aborted, "locking credential provider %s/%s: %v", atespace, ref.GetName(), err)
-			}
-			defer unlockProvider()
-		}
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {

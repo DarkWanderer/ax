@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -328,10 +329,13 @@ type fakeReconciler struct {
 	// simulate the caller's context expiring exactly in the gap between
 	// reconciliation finishing and the handler's final status write.
 	cancelCtx context.CancelFunc
-	// started, when set, is closed as soon as ReconcileWithProvider is
+	// started, when set, is closed (once) as soon as ReconcileWithProvider is
 	// entered, so a test can wait for reconciliation (and any credential
-	// provider lock held across it) to be underway before acting.
-	started chan struct{}
+	// provider lock held across it) to be underway before acting. Guarded by
+	// startedOnce since a test may reuse the same fakeReconciler across
+	// multiple calls after the one it's actually synchronizing on.
+	started     chan struct{}
+	startedOnce sync.Once
 	// release, when set, is waited on before ReconcileWithProvider returns,
 	// so a test can hold reconciliation open to probe what else can or
 	// cannot proceed concurrently with it.
@@ -345,7 +349,7 @@ func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	f.reconcileCount++
 	if f.started != nil {
-		close(f.started)
+		f.startedOnce.Do(func() { close(f.started) })
 	}
 	if f.release != nil {
 		<-f.release
@@ -457,6 +461,80 @@ func TestCreateTask_HoldsCredentialProviderLockAcrossReconcile(t *testing.T) {
 	// proceed normally.
 	if _, err := srv.DeleteCredentialProvider(context.Background(), &v1alpha1.DeleteCredentialProviderRequest{Name: "github"}); err != nil {
 		t.Fatalf("DeleteCredentialProvider after release: %v", err)
+	}
+}
+
+// TestCreateTask_FailedProviderLockLeavesNoTaskRecord covers a CreateTask
+// whose credential provider lock acquisition is contended until its request
+// context expires: if that lock were acquired only after the task record is
+// saved, the save would already be durable (tasks are immutable) by the time
+// the lock attempt times out, so CreateTask would report Aborted while a
+// retry then fails with "already exists" forever, having never actually
+// reconciled. The lock must be acquired, and therefore be the thing that
+// fails, before anything is persisted.
+func TestCreateTask_FailedProviderLockLeavesNoTaskRecord(t *testing.T) {
+	holderStarted := make(chan struct{})
+	holderRelease := make(chan struct{})
+	holderRec := &fakeReconciler{started: holderStarted, release: holderRelease}
+	srv := server.NewServer(memory.NewStore(), server.Options{Reconciler: holderRec})
+
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	if _, err := srv.UpdateCredentialProvider(context.Background(), &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: provider}); err != nil {
+		t.Fatalf("UpdateCredentialProvider: %v", err)
+	}
+
+	// Hold the provider's lock open via a first task's in-flight reconcile.
+	holderDone := make(chan error, 1)
+	go func() {
+		_, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+			Task: &v1alpha1.Task{
+				Metadata: &v1alpha1.ObjectMeta{Name: "holder"},
+				Spec:     &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}},
+			},
+		})
+		holderDone <- err
+	}()
+	select {
+	case <-holderStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("holder CreateTask never reached reconciliation")
+	}
+
+	// A second, different task contends for the same provider's lock, with a
+	// context that expires well before the holder releases it.
+	shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err := srv.CreateTask(shortCtx, &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "contender"},
+			Spec:     &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}},
+		},
+	})
+	cancel()
+	if err == nil {
+		t.Fatal("contending CreateTask succeeded despite the provider's lock being held")
+	}
+
+	// The failed attempt must not have left a durable (and immutable) task
+	// record behind: GetTask should report it was never saved.
+	if _, getErr := srv.GetTask(context.Background(), &v1alpha1.GetTaskRequest{Name: "contender"}); status.Code(getErr) != codes.NotFound {
+		t.Fatalf("GetTask after failed lock acquisition: err=%v, want NotFound (no task record should have been saved)", getErr)
+	}
+
+	close(holderRelease)
+	if err := <-holderDone; err != nil {
+		t.Fatalf("holder CreateTask: %v", err)
+	}
+
+	// Now that the lock is free, creating the same task name must succeed --
+	// it must not be stuck as "already exists" from a save that never
+	// actually happened.
+	if _, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "contender"},
+			Spec:     &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateTask retry after lock freed: %v", err)
 	}
 }
 
