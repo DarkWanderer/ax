@@ -368,13 +368,20 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	// templateApplicable, so a round where the custom-template step was
 	// itself skipped doesn't compare the actor's real template against a
 	// stale default and "switch" it away from the correct one. Also gated on
-	// secretLookupErr == nil: a transient (not authoritative "unconfigured")
-	// secret-lookup failure must not switch an existing actor away from a
-	// template that may already have the credential this round couldn't
-	// resolve. This never affects first-time creation -- a freshly created
-	// actor's template already equals templateName, so the switch condition
-	// below is false for it regardless.
-	if templateApplicable && secretLookupErr == nil && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
+	// secretLookupErr == nil unless this round minted a fresh GitHub
+	// installation token (newToken != ""): a transient (not authoritative
+	// "unconfigured") secret-lookup failure must not switch an existing actor
+	// away from a template that may already have the credential this round
+	// couldn't resolve -- UNLESS the actor's *current* template is already
+	// known-stale because its GitHub token was revoked above (line ~240) as
+	// part of minting newToken. In that case staying on the old template
+	// would leave the actor pointed at a dead credential, which is strictly
+	// worse than switching to the new template (correct GitHub token, if
+	// anything a stale model secret for one more round). This never affects
+	// first-time creation -- a freshly created actor's template already
+	// equals templateName, so the switch condition below is false for it
+	// regardless.
+	if templateApplicable && (newToken != "" || secretLookupErr == nil) && (ensuredActor.GetActorTemplate().GetName() != templateName || ensuredActor.GetActorTemplate().GetAtespace() != templateAtespace) {
 		// SetActorTemplate's contract only supports a suspended actor. A
 		// running actor (e.g. a non-credentialed resume whose secret rotated
 		// mid-flight) can't take the new template now; skip it here rather

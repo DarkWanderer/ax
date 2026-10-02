@@ -297,6 +297,72 @@ echo "end $(pwd)" >> ` + events + `
 	}
 }
 
+// TestRun_SerializesGoalsAcrossTransitivelyOverlappingPaths covers three
+// bindings where two (a, b) don't directly overlap each other but a third
+// (the common parent) overlaps both: all three must land in one serial
+// queue. Joining the parent to only the first match it finds, instead of
+// merging every queue it overlaps, would let b's goal still run concurrently
+// with the parent's.
+func TestRun_SerializesGoalsAcrossTransitivelyOverlappingPaths(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+echo "start $(pwd)" >> ` + events + `
+sleep 0.2
+echo "end $(pwd)" >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	// a and b are siblings (no direct overlap); root (h.wsPath) is their
+	// common ancestor and is placed last so it joins two already-separate
+	// queues instead of starting the first one itself.
+	h.task.Spec.Workspaces[0] = &v1alpha1.WorkspaceRef{
+		Name: "a",
+		Path: filepath.Join(h.wsPath, "a"),
+		Goal: "do something",
+	}
+	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces,
+		&v1alpha1.WorkspaceRef{Name: "b", Path: filepath.Join(h.wsPath, "b"), Goal: "do something"},
+		&v1alpha1.WorkspaceRef{Name: "root", Path: h.wsPath, Goal: "do something"},
+	)
+	h.task.Spec.Command = []string{"true"}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("events file missing: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("got %d event lines, want 6 (start/end for each of 3 goals): %q", len(lines), lines)
+	}
+	open := 0
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "start "):
+			open++
+			if open > 1 {
+				t.Fatalf("goals overlapped: %q", lines)
+			}
+		case strings.HasPrefix(line, "end "):
+			open--
+		default:
+			t.Fatalf("unexpected event line: %q", line)
+		}
+	}
+}
+
 // TestRun_WorkspaceReadyDoesNotWaitForGoal covers /readyz?check=workspace: it
 // must report ready as soon as file setup finishes, independent of a
 // still-running goal. Goals can run far longer than the reconciler's own

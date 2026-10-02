@@ -232,8 +232,11 @@ func Run(ctx context.Context, cfg Config) error {
 	// other. Two bindings can also name the exact same directory without
 	// matching as strings (e.g. "/workspace/a" and "/workspace/./a");
 	// canonicalizing catches that as the equal-path case of overlap too.
-	var queues [][]goalRun
-	queueFor := make(map[string]int, len(mounts)) // canonical path -> index into queues
+	// canonToRun holds, in encounter order, each eligible goal keyed by its
+	// canonical path; canonOrder preserves that order for deterministic queue
+	// assignment below.
+	canonToRun := make(map[string]goalRun, len(mounts))
+	var canonOrder []string
 	seenPath := make(map[string]bool, len(mounts))
 	for i, m := range mounts {
 		goal := m.ref.GetGoal()
@@ -254,21 +257,48 @@ func Run(ctx context.Context, cfg Config) error {
 			continue
 		}
 		seenPath[canon] = true
-
-		run := goalRun{path: m.path, goal: goal, name: m.ref.GetName()}
-		placed := false
-		for existingCanon, qi := range queueFor {
-			if pathsOverlap(existingCanon, canon) {
-				queues[qi] = append(queues[qi], run)
-				queueFor[canon] = qi
-				placed = true
-				break
+		canonToRun[canon] = goalRun{path: m.path, goal: goal, name: m.ref.GetName()}
+		canonOrder = append(canonOrder, canon)
+	}
+	// Overlap isn't transitive as a pairwise check (A-B and B-C overlapping
+	// doesn't mean A-C do), so a path overlapping two previously-separate
+	// queues must merge both into one connected component rather than only
+	// joining the first match. Union-find does that correctly.
+	parent := make(map[string]string, len(canonOrder))
+	var find func(string) string
+	find = func(c string) string {
+		if parent[c] != c {
+			parent[c] = find(parent[c])
+		}
+		return parent[c]
+	}
+	union := func(a, b string) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	for _, c := range canonOrder {
+		parent[c] = c
+	}
+	for i, a := range canonOrder {
+		for _, b := range canonOrder[i+1:] {
+			if pathsOverlap(a, b) {
+				union(a, b)
 			}
 		}
-		if !placed {
-			queueFor[canon] = len(queues)
-			queues = append(queues, []goalRun{run})
+	}
+	queueIndex := make(map[string]int, len(canonOrder))
+	var queues [][]goalRun
+	for _, c := range canonOrder {
+		root := find(c)
+		qi, ok := queueIndex[root]
+		if !ok {
+			qi = len(queues)
+			queueIndex[root] = qi
+			queues = append(queues, nil)
 		}
+		queues[qi] = append(queues[qi], canonToRun[c])
 	}
 	var goals sync.WaitGroup
 	for _, queue := range queues {

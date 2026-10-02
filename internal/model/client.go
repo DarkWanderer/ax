@@ -327,9 +327,19 @@ func GetKubernetesSecret(ctx context.Context, namespace, secretName, key string)
 		lastErr = err
 	}
 
-	// 2. Fallback to kubectl CLI (for local development outside cluster)
+	// 2. Fallback to kubectl CLI (for local development outside cluster).
+	// --ignore-not-found makes kubectl exit 0 with empty output instead of a
+	// generic error when the secret itself doesn't exist, so that case falls
+	// into the same "raw == \"\"" branch as a missing key below and is
+	// classified as ErrSecretNotFound rather than a transient failure. The
+	// key is addressed via JSONPath bracket notation (quoted literal field
+	// name) rather than interpolated after a dot, since dots are JSONPath
+	// child-field separators, not literal map-key characters (e.g. a
+	// "private-key.pem" secret key would otherwise be read as a nested
+	// "private-key" -> "pem" path that doesn't exist).
+	escapedKey := strings.ReplaceAll(key, "'", `\'`)
 	cmd := exec.CommandContext(ctx, "kubectl", "get", "secret", secretName, "-n", namespace,
-		"-o", fmt.Sprintf("jsonpath={.data.%s}", key))
+		"--ignore-not-found", "-o", fmt.Sprintf("jsonpath={.data['%s']}", escapedKey))
 	out, err := cmd.Output()
 	if err != nil {
 		if lastErr == nil {

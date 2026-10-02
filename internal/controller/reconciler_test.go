@@ -1782,6 +1782,120 @@ func TestClaudeSecretTransientLookupFailurePreservesTemplate(t *testing.T) {
 	}
 }
 
+// TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure
+// covers a suspended credential-provider task whose GitHub installation
+// token is rotated (old one revoked, new one minted and baked into a new
+// template) in the same round that the unrelated Claude/Gemini model-secret
+// lookup transiently fails. Skipping the template switch in that case -- as
+// if preserving a previously-working template -- would actually leave the
+// actor on its OLD template, whose GitHub token was already revoked above:
+// worse than switching, not safer. The switch must go through regardless of
+// the model-secret lookup outcome whenever a fresh GitHub token was minted
+// this round.
+func TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	modelSecretFails := false
+	reconciler.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "app-key" {
+			return "private-key", nil
+		}
+		if modelSecretFails {
+			return "", errors.New("transient secret store error")
+		}
+		return "claude-key-v1", nil
+	}
+	fake := &fakeInstallationTokens{}
+	reconciler.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+
+	// Create (suspended): mints token 1, builds template 1, model secret
+	// lookup succeeds.
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	if fake.minted != 1 {
+		t.Fatalf("minted = %d, want 1", fake.minted)
+	}
+	firstTemplate := mockSrv.actor.GetActorTemplate().GetName()
+
+	// Suspend (revokes token 1), then resume: resuming a credentialed actor
+	// mints a fresh token (token 2) and rotates the template, which is where
+	// the model-secret lookup now fails transiently.
+	task.Status.Phase = "Suspended"
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	modelSecretFails = true
+	task.Status.Phase = "Running"
+	got, err := reconciler.ReconcileWithProvider(context.Background(), task, provider)
+	if err != nil {
+		t.Fatalf("Reconcile failed on a transient model-secret lookup error: %v", err)
+	}
+	if fake.minted != 2 {
+		t.Fatalf("minted = %d, want 2", fake.minted)
+	}
+	// Token 1 is revoked repeatedly along the way (it starts out suspended,
+	// so the create call itself immediately revokes its own freshly minted
+	// token; revoke is also idempotent across suspend/resume calls) -- what
+	// matters here is that token 2 was never revoked.
+	for _, tok := range fake.revoked {
+		if tok == "ghs_test_token_2" {
+			t.Fatalf("revoked = %v, want the freshly minted token 2 to remain live", fake.revoked)
+		}
+	}
+	secondTemplate := mockSrv.actor.GetActorTemplate().GetName()
+	if secondTemplate == firstTemplate {
+		t.Fatalf("actor's template did not switch away from the revoked-token template %q", firstTemplate)
+	}
+	if got.GetStatus().GetPhase() != "Running" {
+		t.Fatalf("phase = %q, want Running", got.GetStatus().GetPhase())
+	}
+	// The actor's current template must carry the new (unrevoked) token, not
+	// the old one that was just revoked above.
+	var tmpl *ateapipb.ActorTemplate
+	for _, c := range mockSrv.createdTemplates {
+		if c.GetMetadata().GetName() == secondTemplate {
+			tmpl = c
+			break
+		}
+	}
+	if tmpl == nil {
+		t.Fatalf("could not find actor's current template %q among created templates", secondTemplate)
+	}
+	var gotToken string
+	for _, e := range tmpl.GetContainers()[0].GetEnv() {
+		if e.GetName() == "GITHUB_TOKEN" {
+			gotToken = e.GetValue()
+		}
+	}
+	if gotToken != "ghs_test_token_2" {
+		t.Fatalf("actor's current template carries GITHUB_TOKEN=%q, want the freshly minted ghs_test_token_2 (not the revoked token)", gotToken)
+	}
+}
+
 func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

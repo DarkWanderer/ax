@@ -17,6 +17,7 @@ package model_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -282,6 +283,84 @@ func TestClient_DefaultModelStore(t *testing.T) {
 	}
 	if clientWithStore.Config().APIKey != "store-secret-resolved-999" {
 		t.Errorf("expected APIKey 'store-secret-resolved-999', got %q", clientWithStore.Config().APIKey)
+	}
+}
+
+// fakeKubectl writes a stand-in "kubectl" script onto PATH that simulates
+// just enough of "kubectl get secret" for GetKubernetesSecret's CLI fallback:
+// a NotFound secret name exits 1 with a kubectl-style error unless
+// --ignore-not-found is passed (in which case it exits 0 with empty output,
+// matching real kubectl), and an existing secret only returns a value when
+// its jsonpath argument addresses the key via bracket notation.
+func fakeKubectl(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	script := `#!/bin/sh
+name=""
+ignore_not_found=0
+jsonpath=""
+shift 2 # drop "get" "secret"
+name="$1"; shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ignore-not-found) ignore_not_found=1 ;;
+    -o) shift; jsonpath="$1" ;;
+  esac
+  shift
+done
+if [ "$name" != "existing-secret" ]; then
+  if [ "$ignore_not_found" = "1" ]; then
+    exit 0
+  fi
+  echo "Error from server (NotFound): secrets \"$name\" not found" >&2
+  exit 1
+fi
+case "$jsonpath" in
+  *"data['private-key.pem']"*)
+    printf '%s' "bXlzZWNyZXQ="
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Force the kubectl CLI fallback path rather than the in-cluster API.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+}
+
+// TestGetKubernetesSecret_KubectlNotFoundIsErrSecretNotFound covers the
+// kubectl CLI fallback (used outside a cluster): a deleted or never-existing
+// secret makes plain "kubectl get secret" exit non-zero with a NotFound
+// error, which must still be classified as model.ErrSecretNotFound -- not a
+// transient failure -- so callers correctly treat it as "not configured"
+// rather than preserving a stale credential indefinitely.
+func TestGetKubernetesSecret_KubectlNotFoundIsErrSecretNotFound(t *testing.T) {
+	fakeKubectl(t)
+	_, err := model.GetKubernetesSecret(context.Background(), "ns", "missing-secret", "key")
+	if !errors.Is(err, model.ErrSecretNotFound) {
+		t.Fatalf("err = %v, want ErrSecretNotFound", err)
+	}
+}
+
+// TestGetKubernetesSecret_KubectlEscapesDottedKey covers a secret key that
+// itself contains a dot (the documented "private-key.pem" GitHub App key):
+// JSONPath treats a dot after .data as a child-field separator, so
+// interpolating the key directly would look up a nested "private-key" ->
+// "pem" path that doesn't exist. The key must be addressed via quoted
+// bracket notation instead.
+func TestGetKubernetesSecret_KubectlEscapesDottedKey(t *testing.T) {
+	fakeKubectl(t)
+	got, err := model.GetKubernetesSecret(context.Background(), "ns", "existing-secret", "private-key.pem")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "mysecret" {
+		t.Fatalf("got %q, want %q", got, "mysecret")
 	}
 }
 
