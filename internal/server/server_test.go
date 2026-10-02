@@ -328,6 +328,14 @@ type fakeReconciler struct {
 	// simulate the caller's context expiring exactly in the gap between
 	// reconciliation finishing and the handler's final status write.
 	cancelCtx context.CancelFunc
+	// started, when set, is closed as soon as ReconcileWithProvider is
+	// entered, so a test can wait for reconciliation (and any credential
+	// provider lock held across it) to be underway before acting.
+	started chan struct{}
+	// release, when set, is waited on before ReconcileWithProvider returns,
+	// so a test can hold reconciliation open to probe what else can or
+	// cannot proceed concurrently with it.
+	release chan struct{}
 }
 
 func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
@@ -336,6 +344,12 @@ func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	f.reconcileCount++
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.release != nil {
+		<-f.release
+	}
 	task.Status = &v1alpha1.TaskStatus{
 		Phase: task.GetStatus().GetPhase(),
 	}
@@ -386,6 +400,63 @@ func TestResumeTaskPersistsStatusDespiteExpiredRequestContext(t *testing.T) {
 	}
 	if stored.GetStatus().GetPhase() != "Running" {
 		t.Fatalf("stored phase = %q, want Running (the status write must not be lost to the expired request context)", stored.GetStatus().GetPhase())
+	}
+}
+
+// TestCreateTask_HoldsCredentialProviderLockAcrossReconcile covers a
+// CreateTask whose reconciliation (which mints a GitHub installation token
+// from the credential provider's current repository/permission scope) is
+// still in flight: a concurrent DeleteCredentialProvider for that same
+// provider must not be able to acquire its lock and report success while
+// token issuance against the still-being-read configuration hasn't finished,
+// since that could delete (or a concurrent restrictive update could narrow)
+// the provider out from under a token already being minted from stale scope.
+func TestCreateTask_HoldsCredentialProviderLockAcrossReconcile(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rec := &fakeReconciler{started: started, release: release}
+	srv := server.NewServer(memory.NewStore(), server.Options{Reconciler: rec})
+
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	if _, err := srv.UpdateCredentialProvider(context.Background(), &v1alpha1.UpdateCredentialProviderRequest{CredentialProvider: provider}); err != nil {
+		t.Fatalf("UpdateCredentialProvider: %v", err)
+	}
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+			Task: &v1alpha1.Task{
+				Metadata: &v1alpha1.ObjectMeta{Name: "job"},
+				Spec:     &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}},
+			},
+		})
+		createDone <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CreateTask never reached reconciliation")
+	}
+
+	// CreateTask is now holding the credential provider's lock mid-reconcile:
+	// a delete attempting to acquire the same lock must block, not succeed.
+	shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err := srv.DeleteCredentialProvider(shortCtx, &v1alpha1.DeleteCredentialProviderRequest{Name: "github"})
+	cancel()
+	if err == nil {
+		t.Fatal("DeleteCredentialProvider succeeded while CreateTask was still reconciling against that provider")
+	}
+
+	close(release)
+	if err := <-createDone; err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	// With reconciliation finished and the lock released, the delete can now
+	// proceed normally.
+	if _, err := srv.DeleteCredentialProvider(context.Background(), &v1alpha1.DeleteCredentialProviderRequest{Name: "github"}); err != nil {
+		t.Fatalf("DeleteCredentialProvider after release: %v", err)
 	}
 }
 
