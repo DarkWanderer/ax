@@ -706,6 +706,62 @@ func TestCredentialedWorkspaceFailureFailsTask(t *testing.T) {
 	}
 }
 
+// TestNewCredentialedTaskAbortsWhenModelSecretLookupFails covers a brand-new
+// credentialed Claude task whose model API key lookup fails transiently: a
+// fresh GitHub installation token is minted (newToken != ""), but there is no
+// existingActor and so no previous template to carry a model credential
+// forward from. Proceeding anyway would provision and run the actor with a
+// live GitHub token but no model credential, and nothing would ever retry
+// since there is no background reconciliation -- the task must fail and the
+// freshly minted token must be revoked before any actor exists.
+func TestNewCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "key" {
+			return "private-key", nil
+		}
+		return "", errors.New("simulated transient secret store failure")
+	}
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+	got, err := r.ReconcileWithProvider(context.Background(), task, provider)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("expected the new task to fail when its model secret lookup fails with no prior template to carry from: task=%v err=%v", got, err)
+	}
+	if len(mock.createdTemplates) != 0 {
+		t.Fatalf("expected no actor template to be created, got %d", len(mock.createdTemplates))
+	}
+	if fake.minted != 1 {
+		t.Fatalf("minted = %d, want 1 (the token minted before the lookup failure was discovered)", fake.minted)
+	}
+	if len(fake.revoked) != 1 {
+		t.Fatalf("revoked = %v, want the freshly minted token to be revoked since no actor was ever provisioned with it", fake.revoked)
+	}
+}
+
 // TestCredentialedWorkspaceFailureRetriesCleanupOnTransientError covers a
 // workspace that reports failure (HTTP 424) while the cleanup step itself
 // (here, GetActor) fails transiently: with no background reconciliation to

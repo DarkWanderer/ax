@@ -206,6 +206,19 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		}
 	}
 
+	// Resolve every referenced workspace before SaveTask below makes the task
+	// record immutable: a task name can never be reused once saved (even as
+	// Failed), so a workspace lookup failure here must reject CreateTask
+	// outright rather than leave an unrecoverable partial record behind that
+	// an unchanged client retry can't get past.
+	var workspaces []*v1alpha1.Workspace
+	if s.reconciler != nil {
+		workspaces, err = s.fetchWorkspaces(ctx, atespace, task)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
+	}
+
 	if task.Metadata.CreationTimestamp == nil {
 		task.Metadata.CreationTimestamp = timestamppb.Now()
 	}
@@ -219,13 +232,6 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
-		workspaces, err := s.fetchWorkspaces(ctx, atespace, task)
-		if err != nil {
-			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
-			return nil, status.Errorf(codes.Internal, "%v", err)
-		}
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
@@ -414,16 +420,19 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 			}
 			defer unlockProvider()
 		}
+		// A lookup failure here must not record the task Failed: that status
+		// write would stick (there is no background reconciliation to correct
+		// it later) while the actor itself -- if this Resume found it already
+		// running from an earlier call -- was never inspected by the
+		// reconciler and so is left running, with its live credential, under
+		// a status that falsely claims it is not. Leaving the stored phase
+		// alone and failing the RPC lets the caller retry instead.
 		workspaces, err := s.fetchWorkspaces(ctx, atespace, task)
 		if err != nil {
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
 		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)

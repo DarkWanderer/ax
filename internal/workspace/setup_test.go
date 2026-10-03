@@ -392,7 +392,7 @@ func TestRunGoalClaudeWithoutAnthropicKeyDoesNotUseGemini(t *testing.T) {
 	if workspace.RunGoal(context.Background(), path, "write code") {
 		t.Fatal("goal ran without Anthropic credentials")
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.GoalMarkerName(path, "write code"))); !os.IsNotExist(err) {
 		t.Fatalf("goal marker exists without completion: %v", err)
 	}
 }
@@ -605,10 +605,57 @@ IFS= read -r prompt || true
 	if !workspace.RunGoal(context.Background(), path, "create greeting") {
 		t.Fatal("Claude goal did not complete")
 	}
-	marker := filepath.Join(stateDir, workspace.MarkerName(path)+".goal")
+	marker := filepath.Join(stateDir, workspace.GoalMarkerName(path, "create greeting"))
 	content, err := os.ReadFile(marker)
 	if err != nil || !strings.Contains(string(content), "goal: create greeting") {
 		t.Fatalf("goal marker missing or incorrect: %v", err)
+	}
+}
+
+// TestRunGoalDistinguishesAliasedGoals covers two accepted bindings that
+// alias the same physical directory under different path spellings (here,
+// "<dir>" and "<dir>/.", both normalized to the same canonical path by
+// filepath.Clean) but specify different goals. The runner's queue grouping
+// keeps both bindings queued rather than dropping the second as a duplicate,
+// so RunGoal must still be able to tell them apart: a path-only completion
+// marker would let the first goal's marker make RunGoal silently skip the
+// second binding's distinct goal.
+func TestRunGoalDistinguishesAliasedGoals(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+
+	path := t.TempDir()
+	alias := path + "/."
+
+	if !workspace.RunGoal(context.Background(), path, "goal one") {
+		t.Fatal("first binding's goal did not run")
+	}
+	if !workspace.RunGoal(context.Background(), alias, "goal two") {
+		t.Fatal("second binding's distinct goal was skipped as already completed")
+	}
+
+	m1 := filepath.Join(stateDir, workspace.GoalMarkerName(path, "goal one"))
+	m2 := filepath.Join(stateDir, workspace.GoalMarkerName(alias, "goal two"))
+	c1, err := os.ReadFile(m1)
+	if err != nil || !strings.Contains(string(c1), "goal: goal one") {
+		t.Fatalf("marker for goal one missing or incorrect: %v", err)
+	}
+	c2, err := os.ReadFile(m2)
+	if err != nil || !strings.Contains(string(c2), "goal: goal two") {
+		t.Fatalf("marker for goal two missing or incorrect: %v", err)
 	}
 }
 
@@ -681,7 +728,7 @@ IFS= read -r prompt || true
 	if !workspace.RunGoal(context.Background(), path, "create greeting") {
 		t.Fatal("Claude gateway goal did not complete")
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, workspace.MarkerName(path)+".goal")); err != nil {
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.GoalMarkerName(path, "create greeting"))); err != nil {
 		t.Fatalf("goal marker missing: %v", err)
 	}
 }

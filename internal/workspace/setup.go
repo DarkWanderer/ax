@@ -201,9 +201,19 @@ func RunGoal(ctx context.Context, targetPath, goal string) bool {
 		targetPath = abs
 	}
 
-	markerPath := filepath.Join(AXDir, MarkerName(targetPath)+goalMarkerSuffix)
+	markerPath := filepath.Join(AXDir, GoalMarkerName(targetPath, goal))
 	if _, err := os.Stat(markerPath); err == nil {
 		slog.Info("workspace goal already carried out; skipping", "path", targetPath)
+		return false
+	}
+	// A path-only marker here predates per-goal markers: MarkGoalHandledByLegacySetup
+	// writes one, without knowing (or needing) the goal text, for a workspace whose
+	// single goal already ran once inline under a pre-split runner. That one-time
+	// migration artifact must still be honored regardless of what goal is configured
+	// now, unlike the per-goal marker above.
+	legacyMarkerPath := filepath.Join(AXDir, MarkerName(targetPath)+goalMarkerSuffix)
+	if _, err := os.Stat(legacyMarkerPath); err == nil {
+		slog.Info("workspace goal already carried out by a pre-split runner; skipping", "path", targetPath)
 		return false
 	}
 
@@ -516,6 +526,18 @@ func bootstrapTimeout() time.Duration {
 // container track their setup independently.
 func MarkerName(path string) string {
 	return InitializedMarkerFilename + "-" + sanitizePath(path)
+}
+
+// GoalMarkerName returns the completion-marker file name for a workspace
+// goal. It must depend on both path and goal, not path alone: two accepted
+// bindings can alias the same physical directory under different path
+// spellings (e.g. "/workspace/a" and "/workspace/a/.", both normalized by
+// filepath.Clean inside sanitizePath) while specifying different goals, and
+// a path-only marker would let the first binding's completion marker make
+// RunGoal silently skip the second binding's distinct goal.
+func GoalMarkerName(path, goal string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(path) + "\x00" + goal))
+	return InitializedMarkerFilename + "-goal-" + hex.EncodeToString(sum[:]) + goalMarkerSuffix
 }
 
 // legacyMarkerName returns the marker name a runner from before per-path

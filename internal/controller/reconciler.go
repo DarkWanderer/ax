@@ -345,7 +345,18 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// down), so a stale task-supplied value must not win over the
 		// template's last known-working one just because it happened to
 		// already be non-empty.
-		if newToken != "" && existingActor != nil {
+		if newToken != "" {
+			if existingActor == nil {
+				// A brand-new actor has no previous template to carry a model
+				// credential forward from: proceeding would provision it
+				// (with a freshly minted, live GitHub token) running a goal
+				// it has no model credential to actually execute, and
+				// nothing will ever retry this since there is no background
+				// reconciliation. Fail now, before the actor exists, while
+				// the only cleanup needed is revoking the token just minted.
+				r.revokeForCleanup(newToken)
+				return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key for new task: %v", secretLookupErr), now)
+			}
 			oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName())
 			if err != nil {
 				// Proceeding here would build and apply a replacement template

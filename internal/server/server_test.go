@@ -772,6 +772,13 @@ func TestCreateTask_FailsWhenWorkspaceLookupFails(t *testing.T) {
 	if rec.reconcileCount != 0 {
 		t.Errorf("expected ReconcileWithProvider not to be called with an incomplete workspace slice, got %d calls", rec.reconcileCount)
 	}
+	// The task must never have been persisted: SaveTask makes a task name
+	// immutable, so if the workspace lookup failure happened after SaveTask,
+	// an unchanged client retry would get "already exists" despite no actor
+	// ever having been provisioned, and have to explicitly delete first.
+	if _, err := srv.GetTask(context.Background(), &v1alpha1.GetTaskRequest{Name: "task-ws-fail"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("expected no task record to be left behind, got %v", err)
+	}
 }
 
 // TestSuspendTask_TransientLookupFailuresDoNotBlockSuspension covers a
@@ -830,5 +837,57 @@ func TestSuspendTask_TransientLookupFailuresDoNotBlockSuspension(t *testing.T) {
 	}
 	if len(rec.lastWorkspaces) != 0 {
 		t.Errorf("expected no workspaces to be passed through after the lookup failed, got %v", rec.lastWorkspaces)
+	}
+}
+
+// TestResumeTask_LookupFailureLeavesStoredPhaseUnchanged covers a ResumeTask
+// call on an already-running credentialed task whose workspace or credential
+// provider lookup then fails transiently. Forcing the stored phase to Failed
+// here (as a plain lookup failure previously did) would stick -- there is no
+// background reconciliation to correct it -- while the reconciler was never
+// actually invoked to inspect or stop the still-running actor, leaving a
+// live actor and credential under a status that falsely claims otherwise.
+// The stored phase must instead be left as it was, so the caller can retry.
+func TestResumeTask_LookupFailureLeavesStoredPhaseUnchanged(t *testing.T) {
+	base := memory.NewStore()
+	if err := base.SaveWorkspace(context.Background(), &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "ws-a", Atespace: "default"},
+	}); err != nil {
+		t.Fatalf("SaveWorkspace: %v", err)
+	}
+	st := &failLookupStore{Store: base}
+	rec := &fakeReconciler{}
+	srv := server.NewServer(st, server.Options{Reconciler: rec})
+
+	if _, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-resume-fail"},
+			Spec: &v1alpha1.TaskSpec{
+				Image:      "alpine",
+				Workspaces: []*v1alpha1.WorkspaceRef{{Name: "ws-a"}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := srv.ResumeTask(context.Background(), &v1alpha1.ResumeTaskRequest{Name: "task-resume-fail"}); err != nil {
+		t.Fatalf("initial ResumeTask: %v", err)
+	}
+
+	st.failWorkspace = "ws-a"
+	reconcileCountBefore := rec.reconcileCount
+	if _, err := srv.ResumeTask(context.Background(), &v1alpha1.ResumeTaskRequest{Name: "task-resume-fail"}); err == nil {
+		t.Fatal("expected the second ResumeTask to fail when the workspace lookup fails")
+	}
+	if rec.reconcileCount != reconcileCountBefore {
+		t.Errorf("expected ReconcileWithProvider not to be called when the workspace lookup fails, got %d more calls", rec.reconcileCount-reconcileCountBefore)
+	}
+
+	stored, err := srv.GetTask(context.Background(), &v1alpha1.GetTaskRequest{Name: "task-resume-fail"})
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if stored.GetStatus().GetPhase() == "Failed" {
+		t.Fatal("stored phase was forced to Failed on a lookup failure, without the reconciler ever inspecting the still-running actor")
 	}
 }
