@@ -428,33 +428,35 @@ func TestGoalPredatesSplit(t *testing.T) {
 	}
 }
 
-// TestGoalPredatesSplit_LegacyMarkerName covers the actual migration scenario:
-// a workspace initialized by a runner from before per-path marker names
-// included a digest has its marker at the old, undigested name, which the
-// current MarkerName no longer produces. GoalPredatesSplit must still find
-// it there and treat the workspace as pre-split.
+// TestGoalPredatesSplit_LegacyMarkerName covers the actual migration scenario
+// the legacy-compat shim remains safely useful for: a single-segment path (no
+// "/" left after trimming, so its flattened legacy name can't collide with
+// some other path's) initialized by a runner from before per-path marker
+// names included a digest has its marker at the old, undigested name, which
+// the current MarkerName no longer produces. GoalPredatesSplit must still
+// find it there and treat the workspace as pre-split. (A nested or
+// hyphenated path no longer gets this treatment at all -- see
+// TestGoalPredatesSplit_AmbiguousLegacyMarkerNameNotTrusted -- since this
+// function can't tell a genuine single-writer history apart from a collision
+// with some other path without visibility into every workspace this task
+// binds.)
 func TestGoalPredatesSplit_LegacyMarkerName(t *testing.T) {
 	stateDir := t.TempDir()
 	origAXDir := workspace.AXDir
 	workspace.AXDir = stateDir
 	t.Cleanup(func() { workspace.AXDir = origAXDir })
-	path := t.TempDir()
+	// A single-segment absolute path (no "/" or "-" in it, so it's eligible
+	// for legacy trust). GoalPredatesSplit only ever touches AXDir, never
+	// this path itself, so it need not exist on disk.
+	path := "/legacysinglesegmentworkspace"
 
-	legacyName := "initialized-" + strings.ReplaceAll(strings.Trim(path, "/"), "/", "-")
+	legacyName := "initialized-" + strings.TrimPrefix(path, "/")
 	if err := os.WriteFile(filepath.Join(stateDir, legacyName), []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	if !workspace.GoalPredatesSplit(path) {
 		t.Fatal("a marker at the pre-digest legacy name should read as predating the split")
-	}
-
-	res, err := workspace.PrepareWorkspace(context.Background(), nil, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.IsMaidenRun {
-		t.Fatal("a workspace with only a legacy marker was re-run as a maiden run")
 	}
 }
 
@@ -494,6 +496,44 @@ func TestGoalPredatesSplit_AmbiguousLegacyMarkerNameNotTrusted(t *testing.T) {
 	}
 	if !res.IsMaidenRun {
 		t.Fatal("a path whose legacy marker name is ambiguous with another path skipped its maiden run")
+	}
+}
+
+// TestGoalPredatesSplit_SlashPathDoesNotTrustCollidingLegacyMarker covers the
+// other side of the same collision: the slash-separated path itself (e.g.
+// "/base/a/b", colliding with "/base/a-b") contains no literal hyphen in any
+// of its own segments, so rejecting legacy trust only for hyphenated paths
+// would still let it compute and trust that same, collision-prone flattened
+// name -- even though the marker there might genuinely have been written for
+// the other, hyphenated path. legacyMarkerName has no visibility into sibling
+// workspace paths to tell them apart, so any multi-segment path must decline
+// legacy trust altogether, not just the hyphenated half of each pair.
+func TestGoalPredatesSplit_SlashPathDoesNotTrustCollidingLegacyMarker(t *testing.T) {
+	stateDir := t.TempDir()
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	t.Cleanup(func() { workspace.AXDir = origAXDir })
+	base := t.TempDir()
+
+	hyphenPath := filepath.Join(base, "a-b")
+	slashPath := filepath.Join(base, "a", "b")
+
+	// A legacy marker at the name both paths flatten to, written, in this
+	// scenario, for hyphenPath.
+	legacyName := "initialized-" + strings.ReplaceAll(strings.Trim(hyphenPath, "/"), "/", "-")
+	if err := os.WriteFile(filepath.Join(stateDir, legacyName), []byte("workspace: w\ninitialized_at: 2020-01-01T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if workspace.GoalPredatesSplit(slashPath) {
+		t.Fatal("a legacy marker name ambiguous with another path was trusted by the slash-separated side")
+	}
+	res, err := workspace.PrepareWorkspace(context.Background(), nil, slashPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsMaidenRun {
+		t.Fatal("the slash-separated side of a colliding legacy marker name skipped its maiden run")
 	}
 }
 

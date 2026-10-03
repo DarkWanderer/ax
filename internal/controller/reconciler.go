@@ -191,14 +191,24 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	suspendingExisting := taskSuspending && existingActor != nil
 
 	if ref != nil && !suspendingExisting {
+		// These checks can fail for a task whose actor is already RUNNING (the
+		// provider was deleted, or edited into an invalid or more restrictive
+		// shape, after the actor was resumed under its old configuration): a
+		// plain credentialFailure here would only mark the stored task Failed
+		// and return, leaving that actor running with its already-minted,
+		// still-live installation token indefinitely, since there is no
+		// background reconciliation to suspend and revoke it later. Stop the
+		// existing actor first in that case, same as an explicit suspend
+		// would, rather than reporting failure while the actor and its
+		// credential remain live.
 		if provider == nil || provider.GetMetadata().GetName() != ref.GetName() || provider.GetMetadata().GetAtespace() != atespace {
-			return r.credentialFailure(task, "credential provider is missing from the task atespace", now)
+			return r.credentialFailureStoppingActor(task, "credential provider is missing from the task atespace", now, atespace, actorName, existingActor)
 		}
 		if err := v1alpha1.ValidateCredentialProvider(provider); err != nil {
-			return r.credentialFailure(task, err.Error(), now)
+			return r.credentialFailureStoppingActor(task, err.Error(), now, atespace, actorName, existingActor)
 		}
 		if err := validateCredentialedWorkspaces(provider, workspaces); err != nil {
-			return r.credentialFailure(task, err.Error(), now)
+			return r.credentialFailureStoppingActor(task, err.Error(), now, atespace, actorName, existingActor)
 		}
 	}
 	if ref != nil {
@@ -317,11 +327,20 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// template's last known-working one just because it happened to
 		// already be non-empty.
 		if newToken != "" && existingActor != nil {
-			if oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName()); err == nil {
-				for _, key := range []string{anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey} {
-					if v := templateEnvValue(oldTmpl, key); v != "" {
-						extraEnv[key] = v
-					}
+			oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName())
+			if err != nil {
+				// Proceeding here would build and apply a replacement template
+				// missing the model credential, with no way to carry it
+				// forward: that's worse than stopping now, since the actor
+				// hasn't been touched yet this round and so remains on its
+				// current (if GitHub-token-stale) template rather than one
+				// that's also missing its model credential.
+				r.revokeForCleanup(newToken)
+				return r.credentialFailure(task, fmt.Sprintf("could not read previous actor template to carry its model credential forward: %v", err), now)
+			}
+			for _, key := range []string{anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey} {
+				if v := templateEnvValue(oldTmpl, key); v != "" {
+					extraEnv[key] = v
 				}
 			}
 		}
@@ -646,16 +665,47 @@ func (r *TaskReconciler) credentialFailure(task *v1alpha1.Task, message string, 
 	return task, errors.New(message)
 }
 
+// credentialFailureStoppingActor reports the same terminal credentialFailure,
+// but first stops an already-provisioned actor (suspend + revoke, with
+// retries) when one exists: a validation failure here can occur while the
+// actor is RUNNING with a live installation token -- e.g. its credential
+// provider was deleted or edited into an invalid or more restrictive shape
+// after it was last resumed -- and with no background reconciliation to
+// suspend and revoke it later, reporting failure without also stopping it
+// would leave that actor and its credential live indefinitely.
+func (r *TaskReconciler) credentialFailureStoppingActor(task *v1alpha1.Task, message string, now time.Time, atespace, actorName string, existingActor *ateapipb.Actor) (*v1alpha1.Task, error) {
+	if existingActor != nil {
+		if err := r.suspendAndRevokeWithRetry(atespace, actorName); err != nil {
+			slog.Error("could not stop actor after a credential validation failure; actor may still be running with a live installation token and needs manual cleanup", "actor", actorName, "error", err)
+		}
+	}
+	return r.credentialFailure(task, message, now)
+}
+
 // revokeForCleanup revokes a token minted earlier in a Reconcile call that
 // then failed a later step, using a fresh context instead of the caller's:
 // that context may itself be why the later step failed (canceled or expired),
-// and the only copy of the token must still be revoked.
+// and the only copy of the token must still be revoked. It retries a few
+// times: this is often the token's only remaining trace (e.g. when the
+// actor template that would have stored it was never successfully created),
+// so a single transient failure here would otherwise leave it live until
+// GitHub expires it, with no background reconciliation to retry later.
 func (r *TaskReconciler) revokeForCleanup(token string) {
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
-	defer cancel()
-	if err := r.InstallationTokens.Revoke(cleanupCtx, token); err != nil {
-		slog.Warn("could not revoke installation token during cleanup", "error", err)
+	var lastErr error
+	for attempt := 1; attempt <= workspaceFailureCleanupAttempts; attempt++ {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupRevokeTimeout)
+		err := r.InstallationTokens.Revoke(cleanupCtx, token)
+		cancel()
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if attempt < workspaceFailureCleanupAttempts {
+			slog.Warn("could not revoke installation token during cleanup; retrying", "attempt", attempt, "error", err)
+			time.Sleep(r.CleanupRetryDelay)
+		}
 	}
+	slog.Error("could not revoke installation token during cleanup; token may still be live and needs manual cleanup", "error", lastErr)
 }
 
 // suspendAndRevoke suspends actor on Substrate and revokes its current GitHub
@@ -733,8 +783,13 @@ func (r *TaskReconciler) suspendAndRevokeWithRetry(atespace, actorName string) e
 // user, not just the conventional "git@github.com:" spelling (e.g. a bare
 // "github.com:org/private.git" or "alice@github.com:org/private.git" would
 // otherwise fall through url.Parse with no recognizable hostname and skip
-// GitHub-specific validation entirely).
-var scpLikeGitHubRemote = regexp.MustCompile(`(?i)^(?:[a-zA-Z0-9][a-zA-Z0-9._-]*@)?github\.com:`)
+// GitHub-specific validation entirely). The user portion is matched by what
+// it excludes, not an allowlist of characters it permits: Git imposes no
+// charset restriction on it (e.g. "foo+bar@github.com:..." is valid scp-like
+// syntax), so matching is anchored on reaching "github.com:" with nothing
+// resembling another "@", ":", "/" or whitespace in between, rather than on
+// which characters a username may contain.
+var scpLikeGitHubRemote = regexp.MustCompile(`(?i)^(?:[^@:/\s]*@)?github\.com:`)
 
 func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, workspaces []*v1alpha1.Workspace) error {
 	allowed := make(map[string]bool)

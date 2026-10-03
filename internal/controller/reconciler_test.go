@@ -458,6 +458,50 @@ func TestAmbiguousResumeFailureSuspendsActorBeforeRevoking(t *testing.T) {
 	}
 }
 
+// TestRevokeForCleanupRetriesTransientFailure covers a compensating revoke
+// (here, the one after an ambiguous resume failure forces the actor back to
+// SUSPENDED) whose first attempt fails transiently: this revoke is often the
+// token's only remaining trace -- e.g. when the actor template that would
+// have stored it was never successfully created -- so giving up after one
+// failure would leave it live until GitHub expires it, with no background
+// reconciliation to retry later. It must retry instead.
+func TestRevokeForCleanupRetriesTransientFailure(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{resumeActorErr: errors.New("deadline exceeded")}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.CleanupRetryDelay = time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{revokeFails: 1}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}, Status: &v1alpha1.TaskStatus{Conditions: []*v1alpha1.Condition{{Type: "WorkspaceReady", Status: "True"}}}}
+
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(ctx, task, provider); err == nil {
+		t.Fatal("expected the ambiguous resume failure to be reported as an error")
+	}
+	if len(mock.suspendedActors) != 1 {
+		t.Fatalf("suspendedActors=%v, want the actor forced back to SUSPENDED after the ambiguous resume failure", mock.suspendedActors)
+	}
+	if len(fake.revoked) != 1 || fake.revoked[0] != "ghs_test_token_1" {
+		t.Fatalf("revoked=%v, want the token revoked despite the first attempt failing transiently", fake.revoked)
+	}
+}
+
 // TestAmbiguousResumeFailureKeepsTokenWhenSuspendFails covers the case where
 // the suspend attempted after an ambiguous resume failure itself fails (as it
 // would if resume's own failure were a canceled/expired context, which the
@@ -769,12 +813,15 @@ func TestCredentialedWorkspaceRejectsCaseVariantSCPURL(t *testing.T) {
 // "git@github.com:" spelling was rejected outright, but a bare
 // "github.com:org/repo.git" (no user) or one with a different user also
 // targets GitHub over SSH and must be rejected the same way, not fall through
-// url.Parse with no recognizable hostname and skip validation entirely.
+// url.Parse with no recognizable hostname and skip validation entirely. Git
+// imposes no charset restriction on the user portion (e.g. a "+" is valid),
+// so an allowlist of permitted username characters is also not enough.
 func TestCredentialedWorkspaceRejectsGenericSCPURL(t *testing.T) {
 	for _, remote := range []string{
 		"github.com:org/repo.git",
 		"alice@github.com:org/repo.git",
 		"GitHub.com:org/repo.git",
+		"foo+bar@github.com:org/repo.git",
 	} {
 		t.Run(remote, func(t *testing.T) {
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -870,6 +917,12 @@ type mockControlServer struct {
 	// caller's context expiring in the narrow window right after a real
 	// Substrate suspend succeeds.
 	onSuspendActor func()
+	// getActorTemplateFunc, when set, intercepts GetActorTemplate calls for
+	// the named template: a non-nil error return is returned to the caller
+	// instead of the normal lookup, so a test can simulate one specific
+	// GetActorTemplate call failing (e.g. the second of two calls for the
+	// same template) without disabling lookups for that template entirely.
+	getActorTemplateFunc func(name string) error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -879,6 +932,11 @@ func noSecrets(context.Context, string, string, string) (string, error) {
 
 func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	ref := req.GetActorTemplate()
+	if m.getActorTemplateFunc != nil {
+		if err := m.getActorTemplateFunc(ref.GetName()); err != nil {
+			return nil, err
+		}
+	}
 	for _, tmpl := range m.createdTemplates {
 		if tmpl.GetMetadata().GetName() == ref.GetName() {
 			return tmpl, nil
@@ -2198,6 +2256,171 @@ func TestCredentialedTemplateCarryForwardOverwritesStaleTaskSuppliedSecret(t *te
 	}
 	if gotModelKey != "claude-key-v1" {
 		t.Fatalf("actor's current template carries ANTHROPIC_API_KEY=%q, want the last successfully-resolved %q to overwrite the stale task-supplied value", gotModelKey, "claude-key-v1")
+	}
+}
+
+// TestCredentialedRotationAbortsWhenOldTemplateUnreadable covers the same
+// token-rotation-during-transient-model-secret-failure scenario, but where
+// reading the actor's current template (to carry its model credential
+// forward) itself fails. Silently skipping the carry-forward and proceeding
+// would apply a replacement template with the new GitHub token but no model
+// credential at all; the rotation must instead abort -- revoking the freshly
+// minted token and reporting failure -- leaving the actor on its current
+// template rather than switching it to an incomplete one.
+func TestCredentialedRotationAbortsWhenOldTemplateUnreadable(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	modelSecretFails := false
+	reconciler.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "app-key" {
+			return "private-key", nil
+		}
+		if modelSecretFails {
+			return "", errors.New("transient secret store error")
+		}
+		return "claude-key-v1", nil
+	}
+	fake := &fakeInstallationTokens{}
+	reconciler.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	firstTemplate := mockSrv.actor.GetActorTemplate().GetName()
+	task.Status.Phase = "Suspended"
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old token is read fine (the first GetActorTemplate call for this
+	// template succeeds), but a second, transient failure hits specifically
+	// the carry-forward's own later read of the same template, just as the
+	// model-secret lookup also fails this round -- forcing the GitHub token
+	// rotation that would otherwise apply an incomplete replacement template.
+	getActorTemplateCalls := 0
+	mockSrv.getActorTemplateFunc = func(name string) error {
+		if name != firstTemplate {
+			return nil
+		}
+		getActorTemplateCalls++
+		if getActorTemplateCalls == 2 {
+			return status.Errorf(codes.Unavailable, "transient control plane error")
+		}
+		return nil
+	}
+	modelSecretFails = true
+	task.Status.Phase = "Running"
+	got, err := reconciler.ReconcileWithProvider(context.Background(), task, provider)
+	if err == nil {
+		t.Fatal("Reconcile succeeded despite the old actor template being unreadable for credential carry-forward")
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed", got.GetStatus().GetPhase())
+	}
+	if got := mockSrv.actor.GetActorTemplate().GetName(); got != firstTemplate {
+		t.Fatalf("actor's template = %q, want unchanged (%q): the actor must not be switched to an incomplete template", got, firstTemplate)
+	}
+	var revokedSecondToken bool
+	for _, tok := range fake.revoked {
+		if tok == "ghs_test_token_2" {
+			revokedSecondToken = true
+		}
+	}
+	if !revokedSecondToken {
+		t.Fatalf("revoked = %v, want the freshly minted token revoked since the rotation was aborted", fake.revoked)
+	}
+}
+
+// TestCredentialedValidationFailureStopsRunningActor covers a credentialed
+// task whose actor is already RUNNING when its credential provider is
+// deleted (or edited into an invalid shape) out from under it: the next
+// reconcile for that task (e.g. a routine resume) fails provider validation
+// before ever reaching the suspend-and-revoke path meant for an explicit
+// suspend, and credentialFailure alone would just mark the stored task
+// Failed and return -- leaving the actor running with its already-minted,
+// still-live installation token indefinitely, since there is no background
+// reconciliation to suspend and revoke it later. The actor must be stopped
+// as part of reporting this failure.
+func TestCredentialedValidationFailureStopsRunningActor(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	fake := &fakeInstallationTokens{}
+	r.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+
+	// Create (suspended), then resume: the actor becomes RUNNING with a live
+	// installation token.
+	if _, err := r.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Phase = "Running"
+	if _, err := r.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	if mock.actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Fatalf("actor state = %v, want RUNNING before the provider is removed", mock.actor.GetStatus().GetState())
+	}
+	// suspendedActors and revoked already have entries from the initial
+	// create-and-suspend above; capture a baseline so the assertions below
+	// confirm a *new* suspend and revoke from this failure, not just the
+	// earlier ones.
+	suspendsBefore := len(mock.suspendedActors)
+	revokesBefore := len(fake.revoked)
+
+	// The provider is now gone (deleted), but the task's reference to it and
+	// its Running status persist, as a routine resume would see them.
+	got, err := r.ReconcileWithProvider(context.Background(), task, nil)
+	if err == nil {
+		t.Fatal("Reconcile succeeded despite the credential provider being missing")
+	}
+	if got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("phase = %q, want Failed", got.GetStatus().GetPhase())
+	}
+	if len(mock.suspendedActors) <= suspendsBefore {
+		t.Fatal("actor was not suspended after the provider validation failure; it may still be running with a live installation token")
+	}
+	if len(fake.revoked) <= revokesBefore {
+		t.Fatal("actor's installation token was not revoked after the provider validation failure")
 	}
 }
 

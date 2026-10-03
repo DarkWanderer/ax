@@ -527,6 +527,15 @@ func MarkerName(path string) string {
 //     itself contains a literal "-" (e.g. "/workspace/a-b"), its flattened
 //     name collides with a distinct path that has a "/" in that same
 //     position instead (e.g. "/workspace/a/b") -- both flatten to "a-b".
+//     Rejecting only the hyphenated side isn't enough: the slash side's own
+//     clean form contains no literal hyphen, so it would still compute and
+//     trust that identical, collision-prone name. The only way to know a
+//     flattened name could not also have come from some other path with a
+//     literal "-" in the position of one of this path's "/"s is for this
+//     path to have no "/" at all post-trim (a single segment): any path with
+//     two or more segments is rejected here too, even when it happens not to
+//     collide with another path actually bound in this task, since this
+//     function has no visibility into sibling workspace paths to tell.
 //   - The scheme also substitutes the literal name "root" for the true root
 //     path "/" (since trimming "/" leaves an empty string), which collides
 //     with any sibling path that happens to be named "/root" (or, from a
@@ -535,7 +544,11 @@ func MarkerName(path string) string {
 // A legacy marker actually written for one such path must not be mistaken for
 // proof that a different, colliding path was already initialized, so callers
 // must treat "" as "no legacy name to check" rather than a literal empty
-// marker file name.
+// marker file name. The practical effect is that the legacy-compat shim only
+// ever fires for a single-segment, non-hyphenated path (typically the
+// top-level default "/workspace"); a nested or hyphenated workspace upgrading
+// from a pre-digest runner simply redoes its maiden-run setup once more,
+// which is the same safe fallback this function already accepts elsewhere.
 func legacyMarkerName(path string) string {
 	if path == "" {
 		path = defaultWorkspacePath
@@ -544,10 +557,10 @@ func legacyMarkerName(path string) string {
 	if clean == "" || clean == "root" {
 		return ""
 	}
-	if strings.Contains(clean, "-") {
+	if strings.ContainsAny(clean, "-/") {
 		return ""
 	}
-	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
+	return InitializedMarkerFilename + "-" + clean
 }
 
 // maxReadablePrefixBytes bounds sanitizePath's human-readable prefix so the
