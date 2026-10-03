@@ -308,14 +308,19 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// previous template's own model credential forward keeps the new
 		// template complete, instead of resuming the actor into a workspace
 		// goal that can't run for lack of credentials while WorkspaceReady may
-		// already be stuck true from an earlier round.
+		// already be stuck true from an earlier round. This must overwrite
+		// rather than merely fill extraEnv: these are controller-managed keys
+		// that the task's own spec.env may also set (and the success path
+		// below unconditionally overwrites, then strips from AX_TASK_YAML, for
+		// exactly that reason -- see the launchTask.Spec.Env filtering further
+		// down), so a stale task-supplied value must not win over the
+		// template's last known-working one just because it happened to
+		// already be non-empty.
 		if newToken != "" && existingActor != nil {
 			if oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName()); err == nil {
 				for _, key := range []string{anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey} {
-					if extraEnv[key] == "" {
-						if v := templateEnvValue(oldTmpl, key); v != "" {
-							extraEnv[key] = v
-						}
+					if v := templateEnvValue(oldTmpl, key); v != "" {
+						extraEnv[key] = v
 					}
 				}
 			}

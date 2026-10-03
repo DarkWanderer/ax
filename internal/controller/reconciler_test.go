@@ -2069,6 +2069,94 @@ func TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure(t *
 	}
 }
 
+// TestCredentialedTemplateCarryForwardOverwritesStaleTaskSuppliedSecret covers
+// the same transient-model-secret-lookup-during-token-rotation scenario as
+// TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure, but
+// with the task's own spec.env also setting a stale ANTHROPIC_API_KEY: since
+// extraEnv is seeded from spec.env before the secret lookup even runs, that
+// stale value is already non-empty by the time the carry-forward logic runs.
+// Carrying the old template's value forward only when extraEnv is still empty
+// would leave the stale task-supplied value in place; it must overwrite it
+// instead, the same way a successful lookup would.
+func TestCredentialedTemplateCarryForwardOverwritesStaleTaskSuppliedSecret(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	modelSecretFails := false
+	reconciler.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "app-key" {
+			return "private-key", nil
+		}
+		if modelSecretFails {
+			return "", errors.New("transient secret store error")
+		}
+		return "claude-key-v1", nil
+	}
+	fake := &fakeInstallationTokens{}
+	reconciler.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Phase = "Suspended"
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+
+	// The task now supplies its own, stale ANTHROPIC_API_KEY, and the
+	// model-secret lookup fails transiently on the resume that rotates the
+	// GitHub token and forces the template switch.
+	task.Spec.Env = append(task.Spec.Env, &v1alpha1.EnvVar{Name: "ANTHROPIC_API_KEY", Value: "stale-task-supplied-key"})
+	modelSecretFails = true
+	task.Status.Phase = "Running"
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatalf("Reconcile failed on a transient model-secret lookup error: %v", err)
+	}
+
+	secondTemplate := mockSrv.actor.GetActorTemplate().GetName()
+	var tmpl *ateapipb.ActorTemplate
+	for _, c := range mockSrv.createdTemplates {
+		if c.GetMetadata().GetName() == secondTemplate {
+			tmpl = c
+			break
+		}
+	}
+	if tmpl == nil {
+		t.Fatalf("could not find actor's current template %q among created templates", secondTemplate)
+	}
+	var gotModelKey string
+	for _, e := range tmpl.GetContainers()[0].GetEnv() {
+		if e.GetName() == "ANTHROPIC_API_KEY" {
+			gotModelKey = e.GetValue()
+		}
+	}
+	if gotModelKey != "claude-key-v1" {
+		t.Fatalf("actor's current template carries ANTHROPIC_API_KEY=%q, want the last successfully-resolved %q to overwrite the stale task-supplied value", gotModelKey, "claude-key-v1")
+	}
+}
+
 func TestTaskReconcilerOpenRouterCredential(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
