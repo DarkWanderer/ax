@@ -32,7 +32,8 @@ The `/workspace` volume is what survives suspend and resume. Agent Substrate sna
 | Path | Behavior |
 |---|---|
 | `/healthz` | Return `200` as soon as the runner is alive. |
-| `/readyz` | Return `503` until the workspace is prepared, then `200`. AX polls this to set the task's `WorkspaceReady` condition, and `ax watch` shows the transition. |
+| `/readyz` | Return `200` once the server is serving. Substrate's container probe; it must not wait for the workspace, because Substrate enables egress only after it passes and workspace setup needs egress. |
+| `/readyz?check=workspace` | Return `503` until the workspace is prepared, then `200`. AX polls this to set the task's `WorkspaceReady` condition, and `ax watch` shows the transition. |
 | `/metadata/v1alpha1/ax/task` | Return the `Task` as `application/yaml`. Optional, but your command and `ax` tooling may expect it. |
 | `/metadata/v1alpha1/ax/workspaces` | Return every bound `Workspace` as a multi-document YAML stream. Optional, as above. |
 
@@ -168,7 +169,7 @@ Once the image is built, the fastest end-to-end check is a task with `debug: tru
 
 - Executable present at `/usr/local/bin/ax-task-runner`
 - Reads `AX_TASK_YAML` and `AX_WORKSPACES_YAML`
-- Serves `/healthz` and `/readyz` on port 80, with `/readyz` returning `503` until every workspace is ready
+- Serves `/healthz` and `/readyz` on port 80, with `/readyz` returning `200` once serving and `/readyz?check=workspace` returning `503` until every workspace is ready
 - Prepares each workspace exactly once across restarts and resumes, at its own path
 - Starts `spec.command` in the first workspace with `AX_METADATA_URL` and `spec.env`
 - Keeps running after the command exits

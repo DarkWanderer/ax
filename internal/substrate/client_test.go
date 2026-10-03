@@ -140,3 +140,11 @@ func TestClient_DeleteActor_PropagatesRPCError(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 }
+
+func TestBuildActorTemplate_ReadyzTimeout(t *testing.T) {
+	tmpl := BuildActorTemplate("ns", "tmpl", "img", nil, nil, "")
+	got := tmpl.GetContainers()[0].GetReadyz().GetTimeoutSeconds()
+	if got < 300 {
+		t.Fatalf("readyz timeout = %ds, want >= 300s", got)
+	}
+}
