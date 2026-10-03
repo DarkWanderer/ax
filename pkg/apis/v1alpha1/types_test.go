@@ -49,6 +49,13 @@ func TestCredentialProviderValidation(t *testing.T) {
 		{"missing key", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret = nil }},
 		{"missing name", func(p *v1alpha1.CredentialProvider) { p.Metadata.Name = "" }},
 		{"invalid name", func(p *v1alpha1.CredentialProvider) { p.Metadata.Name = "Not_Valid" }},
+		// A Secret name or key that can never identify real Kubernetes Secret
+		// data must be rejected here, not only once the first credentialed
+		// task using it fails to resolve it after its immutable record is
+		// already saved.
+		{"uppercase secret name", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Name = "App-Key" }},
+		{"slash in secret name", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Name = "app/key" }},
+		{"jsonpath metacharacter in secret key", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Key = "pem']" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := valid()

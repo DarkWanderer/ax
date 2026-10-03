@@ -2336,6 +2336,79 @@ func TestCredentialedTemplateCarryForwardOverwritesStaleTaskSuppliedSecret(t *te
 	}
 }
 
+// TestCredentialedRotationAbortsWhenOldTemplateNeverHadCredential covers a
+// resume that rotates the GitHub token (forcing a template switch) while the
+// model-secret lookup fails transiently, but where the actor's own existing
+// template never held the model credential in the first place -- e.g. the
+// task was originally created while that secret was authoritatively absent.
+// The carry-forward loop has nothing to copy in that case; proceeding would
+// still apply the replacement template (forced by the token rotation) and
+// resume the actor with no model credential at all, same as if the template
+// read itself had failed. The rotation must instead abort.
+func TestCredentialedRotationAbortsWhenOldTemplateNeverHadCredential(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	modelSecretFails := false
+	reconciler.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "app-key" {
+			return "private-key", nil
+		}
+		if modelSecretFails {
+			return "", errors.New("transient secret store error")
+		}
+		// The model secret is authoritatively absent throughout creation: the
+		// actor's template never carries a model credential to begin with.
+		return "", nil
+	}
+	fake := &fakeInstallationTokens{}
+	reconciler.InstallationTokens = fake
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+	task.Status.Phase = "Suspended"
+	if _, err := reconciler.ReconcileWithProvider(context.Background(), task, provider); err != nil {
+		t.Fatal(err)
+	}
+
+	mintedBefore := fake.minted
+	modelSecretFails = true
+	task.Status.Phase = "Running"
+	got, err := reconciler.ReconcileWithProvider(context.Background(), task, provider)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("expected resume to fail when the old template never had a model credential to carry forward: task=%v err=%v", got, err)
+	}
+	if fake.minted != mintedBefore+1 {
+		t.Fatalf("minted = %d, want %d (the token minted before the missing-credential check)", fake.minted, mintedBefore+1)
+	}
+	if len(fake.revoked) == 0 {
+		t.Fatal("expected the freshly minted token to be revoked since no replacement template was ever applied")
+	}
+}
+
 // TestCredentialedRotationAbortsWhenOldTemplateUnreadable covers the same
 // token-rotation-during-transient-model-secret-failure scenario, but where
 // reading the actor's current template (to carry its model credential

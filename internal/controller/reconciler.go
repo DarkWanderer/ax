@@ -373,6 +373,26 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 					extraEnv[key] = v
 				}
 			}
+			// The old template may itself have never held the credential this
+			// task needs -- e.g. it was created or last resumed while the
+			// secret was authoritatively absent -- in which case the loop
+			// above carried nothing forward. Proceeding would still apply the
+			// replacement template (forced by the GitHub token rotation) and
+			// resume the actor with no model credential at all, same as the
+			// no-prior-template case above; verify the credential this task's
+			// configuration actually requires was recovered, not just that
+			// the copy ran.
+			requiredKey := geminiSecretKey
+			if extraEnv[claudeAgentEnv] == claudeAgent {
+				requiredKey = anthropicSecretKey
+				if extraEnv["AX_CLAUDE_PROVIDER"] == openRouterProvider {
+					requiredKey = "ANTHROPIC_AUTH_TOKEN"
+				}
+			}
+			if extraEnv[requiredKey] == "" {
+				r.revokeForCleanup(newToken)
+				return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key and no prior credential available to carry forward: %v", secretLookupErr), now)
+			}
 		}
 	}
 

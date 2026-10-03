@@ -216,8 +216,8 @@ func ValidateCredentialProvider(p *CredentialProvider) error {
 	if app == nil || app.GetAppId() <= 0 || app.GetInstallationId() <= 0 {
 		return fmt.Errorf("spec.githubApp: positive appId and installationId are required")
 	}
-	if app.GetPrivateKeySecret().GetName() == "" || app.GetPrivateKeySecret().GetKey() == "" {
-		return fmt.Errorf("spec.githubApp.privateKeySecret: name and key are required")
+	if err := validateSecretKeyRef(app.GetPrivateKeySecret()); err != nil {
+		return fmt.Errorf("spec.githubApp.privateKeySecret: %w", err)
 	}
 	if len(app.GetRepositories()) == 0 || len(app.GetRepositories()) > 500 {
 		return fmt.Errorf("spec.githubApp.repositories: must contain 1 to 500 names")
@@ -293,6 +293,32 @@ func (s *TaskSpec) WorkspacePaths() []string {
 const MaxNameLength = 63
 
 var nameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// MaxSecretKeyLength is the longest data key a Kubernetes Secret may have.
+const MaxSecretKeyLength = 253
+
+// secretKeyRegexp matches a valid Kubernetes Secret data key: alphanumeric
+// characters, '-', '_', or '.' (the same charset the Kubernetes API server
+// itself enforces for ConfigMap/Secret keys).
+var secretKeyRegexp = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
+
+// validateSecretKeyRef reports whether ref's name and key could ever
+// identify real Kubernetes Secret data: a name that fails Kubernetes object
+// naming rules, or a key containing characters the API server itself would
+// reject (notably JSONPath metacharacters such as "[", "]", or "'", which
+// GetKubernetesSecret's kubectl fallback embeds into a jsonpath expression),
+// can never resolve, so the provider must be rejected at apply time rather
+// than only once a task using it fails after its immutable record is saved.
+func validateSecretKeyRef(ref *SecretKeyRef) error {
+	if err := ValidateName(ref.GetName()); err != nil {
+		return fmt.Errorf("name: invalid value %q: %w", ref.GetName(), err)
+	}
+	key := ref.GetKey()
+	if key == "" || len(key) > MaxSecretKeyLength || !secretKeyRegexp.MatchString(key) {
+		return fmt.Errorf("key: invalid value %q: must be 1-%d characters, each alphanumeric, '-', '_', or '.'", key, MaxSecretKeyLength)
+	}
+	return nil
+}
 
 // ValidateName reports whether s can be used as a resource name or atespace: a
 // lowercase RFC 1123 label of at most MaxNameLength characters.
