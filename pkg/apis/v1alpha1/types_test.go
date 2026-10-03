@@ -68,6 +68,17 @@ func TestCredentialProviderValidation(t *testing.T) {
 	if err := v1alpha1.ValidateCredentialProvider(valid()); err != nil {
 		t.Fatal(err)
 	}
+
+	// A Kubernetes Secret name is a full RFC 1123 DNS subdomain, not the
+	// single-label RFC 1123 name ax's own resources use: it may contain
+	// '.'-separated labels and run up to 253 characters, well past the
+	// 63-character label limit. A dotted name like "github.app-key" must be
+	// accepted, not rejected as if it were an ax resource name.
+	dotted := valid()
+	dotted.Spec.GithubApp.PrivateKeySecret.Name = "github.app-key"
+	if err := v1alpha1.ValidateCredentialProvider(dotted); err != nil {
+		t.Fatalf("a dotted Secret name must be accepted as a valid DNS subdomain: %v", err)
+	}
 }
 
 func TestTaskRejectsProviderWithGitHubToken(t *testing.T) {

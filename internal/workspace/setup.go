@@ -191,6 +191,19 @@ func prepareWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath st
 // traffic for an actor its control plane considers running, so an agent started during
 // workspace preparation cannot reach its model at all.
 func RunGoal(ctx context.Context, targetPath, goal string) bool {
+	return RunGoalAt(ctx, targetPath, targetPath, goal)
+}
+
+// RunGoalAt is RunGoal, but tracks completion under identityPath instead of
+// targetPath. A binding mounted at a symlink alias of another binding's
+// resolved directory must still execute at its own (lexical) targetPath --
+// that's the directory the agent actually works in -- but must be recognized
+// for completion-marker purposes as the same workspace identityPath resolves
+// to; otherwise an identical goal queued behind the first for the same
+// underlying directory would run again instead of being skipped as already
+// done. Passing targetPath for identityPath (as RunGoal does) is equivalent
+// to tracking completion by the execution path itself.
+func RunGoalAt(ctx context.Context, targetPath, identityPath, goal string) bool {
 	if goal == "" {
 		return false
 	}
@@ -200,8 +213,14 @@ func RunGoal(ctx context.Context, targetPath, goal string) bool {
 	if abs, err := filepath.Abs(targetPath); err == nil {
 		targetPath = abs
 	}
+	if identityPath == "" {
+		identityPath = targetPath
+	}
+	if abs, err := filepath.Abs(identityPath); err == nil {
+		identityPath = abs
+	}
 
-	markerPath := filepath.Join(AXDir, GoalMarkerName(targetPath, goal))
+	markerPath := filepath.Join(AXDir, GoalMarkerName(identityPath, goal))
 	if _, err := os.Stat(markerPath); err == nil {
 		slog.Info("workspace goal already carried out; skipping", "path", targetPath)
 		return false
@@ -211,7 +230,7 @@ func RunGoal(ctx context.Context, targetPath, goal string) bool {
 	// single goal already ran once inline under a pre-split runner. That one-time
 	// migration artifact must still be honored regardless of what goal is configured
 	// now, unlike the per-goal marker above.
-	legacyMarkerPath := filepath.Join(AXDir, MarkerName(targetPath)+goalMarkerSuffix)
+	legacyMarkerPath := filepath.Join(AXDir, MarkerName(identityPath)+goalMarkerSuffix)
 	if _, err := os.Stat(legacyMarkerPath); err == nil {
 		slog.Info("workspace goal already carried out by a pre-split runner; skipping", "path", targetPath)
 		return false

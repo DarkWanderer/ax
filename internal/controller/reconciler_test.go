@@ -762,6 +762,53 @@ func TestNewCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
 	}
 }
 
+// TestNewNonCredentialedTaskAbortsWhenModelSecretLookupFails covers a
+// brand-new task with no CredentialProvider at all (so newToken is always
+// "") whose model API key lookup fails transiently on its very first
+// reconcile. newToken's emptiness must not be mistaken for "nothing to fail
+// closed about": the actor doesn't exist yet either way, and proceeding
+// would provision it with no model credential and nothing to ever retry,
+// exactly as for a credentialed task with no existingActor.
+func TestNewNonCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return "", errors.New("simulated transient secret store failure")
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			Env: []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+		},
+	}
+
+	got, err := r.Reconcile(context.Background(), task)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("expected a new non-credentialed task to fail when its model secret lookup fails, got task=%v err=%v", got, err)
+	}
+	if len(mock.createdTemplates) != 0 {
+		t.Fatalf("expected no actor template to be created, got %d", len(mock.createdTemplates))
+	}
+	if mock.actor != nil {
+		t.Fatalf("expected no actor to be provisioned, got %v", mock.actor)
+	}
+}
+
 // TestCredentialedWorkspaceFailureRetriesCleanupOnTransientError covers a
 // workspace that reports failure (HTTP 424) while the cleanup step itself
 // (here, GetActor) fails transiently: with no background reconciliation to
@@ -965,6 +1012,49 @@ func TestCredentialedWorkspaceRejectsTrailingDotHostname(t *testing.T) {
 	_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
 	if err == nil || !strings.Contains(err.Error(), "trailing dot") {
 		t.Fatalf("trailing-dot GitHub hostname was not rejected: %v", err)
+	}
+}
+
+// TestCredentialedWorkspaceRejectsNonStandardPort covers a GitHub repository
+// URL naming an explicit non-443 port. url.Hostname() discards the port
+// entirely, so such a URL would otherwise pass validation -- but the
+// runner's credential helper (runner/git_credentials.go) only strips a
+// trailing ":443" before comparing the host to "github.com", so it would
+// never recognize "github.com:8443" and would silently clone without
+// credentials instead of authenticating.
+func TestCredentialedWorkspaceRejectsNonStandardPort(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com:8443/org/repo.git"}}}}
+
+	_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
+	if err == nil || !strings.Contains(err.Error(), "port") {
+		t.Fatalf("non-standard-port GitHub repository was not rejected: %v", err)
+	}
+
+	// Port 443 is the HTTPS default and must still be accepted.
+	ws443 := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "two"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com:443/repo/repo.git"}}}}
+	if _, err := r.ReconcileWithProvider(context.Background(), task, provider, ws443); err != nil {
+		t.Fatalf("explicit default port 443 must be accepted: %v", err)
 	}
 }
 

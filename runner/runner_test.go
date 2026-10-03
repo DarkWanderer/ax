@@ -477,6 +477,59 @@ echo "end $(pwd)" >> ` + events + `
 	}
 }
 
+// TestRun_DeduplicatesIdenticalGoalAcrossSymlinkedPaths covers two bindings
+// where one path is a symlink to the other's durable target and both specify
+// the SAME goal: the queue correctly serializes them using the resolved
+// (canonical) path, but completion markers must also be keyed by that same
+// resolved identity -- not by each binding's own lexical path -- or the
+// first run's marker won't suppress the second, and the identical goal (with
+// whatever non-idempotent side effects it has) runs twice against what is
+// actually the same underlying files.
+func TestRun_DeduplicatesIdenticalGoalAcrossSymlinkedPaths(t *testing.T) {
+	t.Setenv("AX_GOAL_AGENT", "claude")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("AX_BOOTSTRAP_TIMEOUT", "5s")
+	events := filepath.Join(t.TempDir(), "events")
+	bin := t.TempDir()
+	script := `#!/bin/sh
+echo "start $(pwd)" >> ` + events + `
+sleep 0.2
+echo "end $(pwd)" >> ` + events + `
+`
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	h := newHarness(t)
+	realPath := filepath.Join(filepath.Dir(h.wsPath), "real")
+	linkPath := filepath.Join(filepath.Dir(h.wsPath), "link")
+	if err := os.MkdirAll(realPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	h.task.Spec.Workspaces[0] = &v1alpha1.WorkspaceRef{Name: "real", Path: realPath, Goal: "do something"}
+	h.task.Spec.Workspaces = append(h.task.Spec.Workspaces,
+		&v1alpha1.WorkspaceRef{Name: "link", Path: linkPath, Goal: "do something"})
+	h.task.Spec.Command = []string{"true"}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+
+	out, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatalf("events file missing: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d event lines, want 2 (one start/end pair; the second binding's identical goal must be recognized as already done, not re-run): %q", len(lines), lines)
+	}
+}
+
 // TestRun_WorkspaceReadyDoesNotWaitForGoal covers /readyz?check=workspace: it
 // must report ready as soon as file setup finishes, independent of a
 // still-running goal. Goals can run far longer than the reconciler's own

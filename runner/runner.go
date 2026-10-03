@@ -230,7 +230,7 @@ func Run(ctx context.Context, cfg Config) error {
 	// a repository the goal itself creates -- does not start until every
 	// goal has finished.
 	type goalRun struct {
-		path, goal, name string
+		path, canon, goal, name string
 	}
 	// Bindings whose canonical paths are equal, or one an ancestor directory
 	// of the other, operate on overlapping (or the same) filesystem trees:
@@ -279,7 +279,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if _, seen := canonToRuns[canon]; !seen {
 			canonOrder = append(canonOrder, canon)
 		}
-		canonToRuns[canon] = append(canonToRuns[canon], goalRun{path: m.path, goal: goal, name: m.ref.GetName()})
+		canonToRuns[canon] = append(canonToRuns[canon], goalRun{path: m.path, canon: canon, goal: goal, name: m.ref.GetName()})
 	}
 	// Overlap isn't transitive as a pairwise check (A-B and B-C overlapping
 	// doesn't mean A-C do), so a path overlapping two previously-separate
@@ -327,7 +327,7 @@ func Run(ctx context.Context, cfg Config) error {
 		go func(queue []goalRun) {
 			defer goals.Done()
 			for _, run := range queue {
-				if workspace.RunGoal(ctx, run.path, run.goal) {
+				if workspace.RunGoalAt(ctx, run.path, run.canon, run.goal) {
 					slog.Info("workspace goal completed", "workspace", run.name, "path", run.path)
 				}
 			}

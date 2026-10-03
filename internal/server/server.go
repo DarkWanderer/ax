@@ -197,13 +197,21 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
 	}
 
+	// Resolved once here and reused after SaveTask below: a second lookup
+	// there could itself fail transiently even though this one succeeded,
+	// which -- like the workspace lookup below -- must not turn into an
+	// unrecoverable immutable Failed record for a task that was otherwise
+	// entirely valid at creation time.
+	var provider *v1alpha1.CredentialProvider
 	if ref := task.GetSpec().GetCredentialProvider(); ref != nil {
-		if _, err := s.store.GetCredentialProvider(ctx, atespace, ref.Name); err != nil {
+		p, err := s.store.GetCredentialProvider(ctx, atespace, ref.Name)
+		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, status.Error(codes.InvalidArgument, "credential provider not found in task atespace")
 			}
 			return nil, status.Errorf(codes.Internal, "checking credential provider: %v", err)
 		}
+		provider = p
 	}
 
 	// Resolve every referenced workspace before SaveTask below makes the task
@@ -232,13 +240,6 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
-		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
-		if err != nil {
-			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
-			task.Status.Phase = "Failed"
-			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
-			return nil, status.Errorf(codes.Internal, "%v", err)
-		}
 		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)

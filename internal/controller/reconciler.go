@@ -345,18 +345,33 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// down), so a stale task-supplied value must not win over the
 		// template's last known-working one just because it happened to
 		// already be non-empty.
-		if newToken != "" {
-			if existingActor == nil {
-				// A brand-new actor has no previous template to carry a model
-				// credential forward from: proceeding would provision it
-				// (with a freshly minted, live GitHub token) running a goal
-				// it has no model credential to actually execute, and
-				// nothing will ever retry this since there is no background
-				// reconciliation. Fail now, before the actor exists, while
-				// the only cleanup needed is revoking the token just minted.
-				r.revokeForCleanup(newToken)
-				return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key for new task: %v", secretLookupErr), now)
+		actorAlreadyProvisioned := existingActor != nil
+		if !actorAlreadyProvisioned && ref == nil {
+			// existingActor above is only ever populated when ref != nil
+			// (credentialed tasks): a non-credentialed task reaching this
+			// point always sees a nil existingActor regardless of whether
+			// its actor already exists, so that alone can't tell a brand-new
+			// actor apart from an already-provisioned one being resumed or
+			// re-suspended. Check directly.
+			if _, err := r.client.GetActor(ctx, atespace, actorName); err == nil {
+				actorAlreadyProvisioned = true
 			}
+		}
+		if !actorAlreadyProvisioned {
+			// A brand-new actor has no previous template to carry a model
+			// credential forward from: proceeding would provision it running
+			// a goal it has no model credential to actually execute, and
+			// nothing will ever retry this since there is no background
+			// reconciliation. Fail now, before the actor exists. This does
+			// not depend on newToken: a task with no CredentialProvider at
+			// all (newToken always "") is just as new, and just as unable to
+			// run its goal without a model credential, as a credentialed one.
+			if newToken != "" {
+				r.revokeForCleanup(newToken)
+			}
+			return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key for new task: %v", secretLookupErr), now)
+		}
+		if newToken != "" {
 			oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName())
 			if err != nil {
 				// Proceeding here would build and apply a replacement template
@@ -876,6 +891,15 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 			}
 			if u.Scheme != "https" || u.User != nil {
 				return fmt.Errorf("credentialed GitHub repository must use HTTPS without embedded credentials")
+			}
+			// The runner's credential helper strips only a trailing ":443"
+			// from the host it's given before comparing it to "github.com"
+			// (see runner/git_credentials.go); any other explicit port would
+			// pass this Hostname()-based check (which discards the port
+			// entirely) but never actually match there, so the clone would
+			// run uncredentialed instead of failing validation up front.
+			if port := u.Port(); port != "" && port != "443" {
+				return fmt.Errorf("credentialed GitHub repository must not specify a port other than 443")
 			}
 			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 			if len(parts) != 2 || !allowed[strings.ToLower(strings.TrimSuffix(parts[1], ".git"))] {

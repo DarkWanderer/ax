@@ -725,6 +725,12 @@ type failLookupStore struct {
 	store.Store
 	failWorkspace string
 	failProvider  string
+	// failProviderOnCall, when nonzero, limits the GetCredentialProvider
+	// failure to that 1-indexed call number instead of every call matching
+	// failProvider -- e.g. to simulate the pre-save existence check
+	// succeeding but a later, separate lookup for the same provider failing.
+	failProviderOnCall int
+	providerCalls      int
 }
 
 func (f *failLookupStore) GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error) {
@@ -736,7 +742,10 @@ func (f *failLookupStore) GetWorkspace(ctx context.Context, atespace, name strin
 
 func (f *failLookupStore) GetCredentialProvider(ctx context.Context, atespace, name string) (*v1alpha1.CredentialProvider, error) {
 	if f.failProvider != "" && name == f.failProvider {
-		return nil, errors.New("simulated transient store failure")
+		f.providerCalls++
+		if f.failProviderOnCall == 0 || f.providerCalls == f.failProviderOnCall {
+			return nil, errors.New("simulated transient store failure")
+		}
 	}
 	return f.Store.GetCredentialProvider(ctx, atespace, name)
 }
@@ -889,5 +898,48 @@ func TestResumeTask_LookupFailureLeavesStoredPhaseUnchanged(t *testing.T) {
 	}
 	if stored.GetStatus().GetPhase() == "Failed" {
 		t.Fatal("stored phase was forced to Failed on a lookup failure, without the reconciler ever inspecting the still-running actor")
+	}
+}
+
+// TestCreateTask_ReusesProviderResolvedBeforeSave covers a CreateTask whose
+// credential-provider existence check (before SaveTask) succeeds, but a
+// second, separate lookup of the same provider used only to prepare for
+// reconciliation would itself fail transiently. SaveTask has by then already
+// made the task record immutable, so that second failure previously turned
+// an otherwise entirely valid creation into an unrecoverable Failed record.
+// The provider resolved before SaveTask must be reused instead of re-fetched.
+func TestCreateTask_ReusesProviderResolvedBeforeSave(t *testing.T) {
+	base := memory.NewStore()
+	if err := base.SaveCredentialProvider(context.Background(), &v1alpha1.CredentialProvider{
+		Metadata: &v1alpha1.ObjectMeta{Name: "provider-a", Atespace: "default"},
+	}); err != nil {
+		t.Fatalf("SaveCredentialProvider: %v", err)
+	}
+	// Only a second GetCredentialProvider call for this provider fails: the
+	// pre-save existence check (the first call) must succeed.
+	st := &failLookupStore{Store: base, failProvider: "provider-a", failProviderOnCall: 2}
+	rec := &fakeReconciler{}
+	srv := server.NewServer(st, server.Options{Reconciler: rec})
+
+	task, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-provider-reuse"},
+			Spec: &v1alpha1.TaskSpec{
+				Image:              "alpine",
+				CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "provider-a"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected CreateTask to succeed by reusing the provider resolved before SaveTask, got %v", err)
+	}
+	if task.GetStatus().GetPhase() == "Failed" {
+		t.Fatal("task was marked Failed despite the provider having already been resolved successfully before SaveTask")
+	}
+	if rec.lastProvider == nil || rec.lastProvider.GetMetadata().GetName() != "provider-a" {
+		t.Fatalf("expected the reconciler to receive the resolved provider, got %v", rec.lastProvider)
+	}
+	if st.providerCalls != 1 {
+		t.Fatalf("GetCredentialProvider called %d times, want exactly 1 (no redundant post-save lookup)", st.providerCalls)
 	}
 }

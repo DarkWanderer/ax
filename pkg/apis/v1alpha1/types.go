@@ -297,6 +297,17 @@ var nameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 // MaxSecretKeyLength is the longest data key a Kubernetes Secret may have.
 const MaxSecretKeyLength = 253
 
+// MaxSecretNameLength is the longest name a Kubernetes Secret may have: unlike
+// MaxNameLength's RFC 1123 label (used for ax's own resource names), a Secret
+// name is a full RFC 1123 DNS subdomain, which allows '.'-separated labels
+// and a longer overall length.
+const MaxSecretNameLength = 253
+
+// secretNameRegexp matches a valid Kubernetes Secret name: an RFC 1123 DNS
+// subdomain, i.e. one or more '.'-separated labels, each a lowercase
+// alphanumeric run optionally containing '-'.
+var secretNameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
 // secretKeyRegexp matches a valid Kubernetes Secret data key: alphanumeric
 // characters, '-', '_', or '.' (the same charset the Kubernetes API server
 // itself enforces for ConfigMap/Secret keys).
@@ -310,8 +321,9 @@ var secretKeyRegexp = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
 // can never resolve, so the provider must be rejected at apply time rather
 // than only once a task using it fails after its immutable record is saved.
 func validateSecretKeyRef(ref *SecretKeyRef) error {
-	if err := ValidateName(ref.GetName()); err != nil {
-		return fmt.Errorf("name: invalid value %q: %w", ref.GetName(), err)
+	name := ref.GetName()
+	if name == "" || len(name) > MaxSecretNameLength || !secretNameRegexp.MatchString(name) {
+		return fmt.Errorf("name: invalid value %q: must be a lowercase RFC 1123 DNS subdomain of at most %d characters", name, MaxSecretNameLength)
 	}
 	key := ref.GetKey()
 	if key == "" || len(key) > MaxSecretKeyLength || !secretKeyRegexp.MatchString(key) {
