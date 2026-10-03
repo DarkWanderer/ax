@@ -215,7 +215,13 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		if existingActor != nil && (existingActor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING || existingActor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RESUMING) && !taskSuspending {
 			token, err := r.actorToken(ctx, existingActor)
 			if err != nil || token == "" {
-				return r.credentialFailure(task, "running actor has no GitHub installation token; suspend and resume the task", now)
+				// Same reasoning as the provider-validation failures above: the
+				// actor is already running (with, for all this inconclusive
+				// check knows, a still-live token), and plain credentialFailure
+				// would just mark the task Failed and return, leaving it
+				// running indefinitely with no background reconciliation to
+				// stop it later.
+				return r.credentialFailureStoppingActor(task, "running actor has no GitHub installation token; suspend and resume the task", now, atespace, actorName, existingActor)
 			}
 		}
 		// Only an already-provisioned actor needs an explicit suspend-and-revoke;
@@ -286,12 +292,20 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 	var secretLookupErr error
 	if extraEnv[claudeAgentEnv] == claudeAgent {
 		if extraEnv["AX_CLAUDE_PROVIDER"] == openRouterProvider {
+			// Cleared unconditionally, not only when the lookup below succeeds:
+			// a task can supply its own stale ANTHROPIC_API_KEY in spec.env, and
+			// leaving it in extraEnv would give Claude a valid Anthropic
+			// credential to silently run against directly -- against the wrong
+			// provider's billing -- instead of either using the OpenRouter
+			// gateway or (if that lookup is itself what's failing) having no
+			// working credential at all, which is the correct, visible outcome
+			// for an OpenRouter-configured task missing its secret.
+			extraEnv[anthropicSecretKey] = ""
 			openRouterKey, err := r.lookupSecret(ctx, atespace, openRouterSecretName, openRouterSecretKey)
 			secretLookupErr = err
 			if openRouterKey != "" {
 				extraEnv["ANTHROPIC_BASE_URL"] = "https://openrouter.ai/api"
 				extraEnv["ANTHROPIC_AUTH_TOKEN"] = openRouterKey
-				extraEnv[anthropicSecretKey] = ""
 			}
 		} else {
 			anthropicKey, err := r.lookupSecret(ctx, atespace, anthropicSecretName, anthropicSecretKey)

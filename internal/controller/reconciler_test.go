@@ -124,16 +124,6 @@ func TestCredentialedTaskLifecycleAcrossWorkspaces(t *testing.T) {
 		t.Fatal("token missing from template or present in Task YAML")
 	}
 	for _, e := range mock.createdTemplates[0].GetContainers()[0].GetEnv() {
-		if e.GetName() == "GITHUB_TOKEN" {
-			e.Value = ""
-			if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err == nil {
-				t.Fatal("running actor without token used uncredentialed fallback")
-			}
-			e.Value = token
-			break
-		}
-	}
-	for _, e := range mock.createdTemplates[0].GetContainers()[0].GetEnv() {
 		if strings.Contains(e.GetValue(), "private-key") {
 			t.Fatal("GitHub App private key entered actor template")
 		}
@@ -168,6 +158,37 @@ func TestCredentialedTaskLifecycleAcrossWorkspaces(t *testing.T) {
 	}
 	if len(mock.createdActors) != 1 {
 		t.Fatalf("durable actor was recreated: %v", mock.createdActors)
+	}
+
+	// A RUNNING actor whose template's token has gone missing must not fall
+	// back to running uncredentialed, and -- since there is no background
+	// reconciliation to catch this later -- must have the actor stopped
+	// rather than just reporting failure while it keeps running. This is
+	// exercised last, since stopping the actor as a side effect would
+	// otherwise disrupt the mint/revoke counts asserted above.
+	suspendsBefore := len(mock.suspendedActors)
+	var currentTemplate *ateapipb.ActorTemplate
+	currentTemplateName := mock.actor.GetActorTemplate().GetName()
+	for _, tmpl := range mock.createdTemplates {
+		if tmpl.GetMetadata().GetName() == currentTemplateName {
+			currentTemplate = tmpl
+			break
+		}
+	}
+	if currentTemplate == nil {
+		t.Fatalf("could not find actor's current template %q", currentTemplateName)
+	}
+	for _, e := range currentTemplate.GetContainers()[0].GetEnv() {
+		if e.GetName() == "GITHUB_TOKEN" {
+			e.Value = ""
+			break
+		}
+	}
+	if _, err := r.ReconcileWithProvider(ctx, task, provider, ws1, ws2); err == nil {
+		t.Fatal("running actor without token used uncredentialed fallback")
+	}
+	if len(mock.suspendedActors) <= suspendsBefore {
+		t.Fatal("actor was not stopped after its token went missing; it may still be running uncredentialed")
 	}
 }
 
@@ -2533,5 +2554,63 @@ func TestOpenRouterCredentialSurvivesTaskSuppliedEnv(t *testing.T) {
 	}
 	if strings.Contains(taskYAML, "stale-task-supplied-key") || strings.Contains(taskYAML, "ANTHROPIC_API_KEY") {
 		t.Errorf("AX_TASK_YAML still carries the task-supplied ANTHROPIC_API_KEY, which the runner would reapply over the container env: %s", taskYAML)
+	}
+}
+
+// TestOpenRouterSelectionClearsStaleAnthropicKeyWhenSecretAbsent covers a task
+// that selects OpenRouter but whose openrouter-api-secret is authoritatively
+// absent (the lookup returns "", nil, not an error): ANTHROPIC_API_KEY was
+// only ever cleared inside the "lookup succeeded" branch, so a task-supplied
+// ANTHROPIC_API_KEY in spec.env would otherwise reach the actor template
+// unchanged, giving Claude a valid Anthropic credential to run against
+// directly -- the wrong provider's billing -- instead of the OpenRouter
+// gateway this task is actually configured to use.
+func TestOpenRouterSelectionClearsStaleAnthropicKeyWhenSecretAbsent(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
+	reconciler.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return "", nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "openrouter-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "example.invalid/runner",
+			Env: []*v1alpha1.EnvVar{
+				{Name: "AX_GOAL_AGENT", Value: "claude"},
+				{Name: "AX_CLAUDE_PROVIDER", Value: "openrouter"},
+				{Name: "ANTHROPIC_API_KEY", Value: "stale-task-supplied-key"},
+			},
+		},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(mockSrv.createdTemplates) != 1 {
+		t.Fatalf("created %d templates, want 1", len(mockSrv.createdTemplates))
+	}
+	env := map[string]string{}
+	for _, v := range mockSrv.createdTemplates[0].Containers[0].Env {
+		env[v.Name] = v.Value
+	}
+	if key, ok := env["ANTHROPIC_API_KEY"]; !ok || key != "" {
+		t.Errorf("ANTHROPIC_API_KEY = %q, want explicitly empty despite the missing OpenRouter secret, not the stale task-supplied value", key)
+	}
+	if env["ANTHROPIC_AUTH_TOKEN"] != "" {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want unset since no OpenRouter key was resolved", env["ANTHROPIC_AUTH_TOKEN"])
 	}
 }
