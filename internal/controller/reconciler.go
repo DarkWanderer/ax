@@ -357,7 +357,7 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 				actorAlreadyProvisioned = true
 			}
 		}
-		if !actorAlreadyProvisioned {
+		if !actorAlreadyProvisioned && taskHasGoal(task) {
 			// A brand-new actor has no previous template to carry a model
 			// credential forward from: proceeding would provision it running
 			// a goal it has no model credential to actually execute, and
@@ -366,6 +366,10 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			// not depend on newToken: a task with no CredentialProvider at
 			// all (newToken always "") is just as new, and just as unable to
 			// run its goal without a model credential, as a credentialed one.
+			// It also doesn't apply to a task with no goal at all (e.g.
+			// command-only): the model credential is only ever consumed by
+			// RunGoal, so an unrelated secret-store outage must not block
+			// provisioning a task that was never going to need it.
 			if newToken != "" {
 				r.revokeForCleanup(newToken)
 			}
@@ -901,6 +905,16 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 			if port := u.Port(); port != "" && port != "443" {
 				return fmt.Errorf("credentialed GitHub repository must not specify a port other than 443")
 			}
+			// The installation token GitHub mints is scoped to exactly the
+			// permissions configured on the provider: a repository name
+			// being allow-listed says nothing about whether that token can
+			// actually read it. Without "contents": read (or write), the
+			// clone fails at credential-helper time after exhausting strict
+			// setup's retries, instead of being rejected here before the now
+			// -immutable task is even saved.
+			if level := provider.GetSpec().GetGithubApp().GetPermissions()["contents"]; level != "read" && level != "write" {
+				return fmt.Errorf("credential provider must grant \"contents\": \"read\" or \"write\" to clone a GitHub repository")
+			}
 			parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 			if len(parts) != 2 || !allowed[strings.ToLower(strings.TrimSuffix(parts[1], ".git"))] {
 				return fmt.Errorf("GitHub repository is not listed in the credential provider")
@@ -926,6 +940,19 @@ func (r *TaskReconciler) actorToken(ctx context.Context, actor *ateapipb.Actor) 
 // container environment, or "" if it has none.
 func templateToken(tmpl *ateapipb.ActorTemplate) string {
 	return templateEnvValue(tmpl, "GITHUB_TOKEN")
+}
+
+// taskHasGoal reports whether any workspace binding on the task has a goal
+// configured. The model API key (Anthropic/Gemini) is only ever consumed by
+// RunGoal; a command-only task with no goal anywhere never needs one, so a
+// secret-lookup failure must not block provisioning it.
+func taskHasGoal(task *v1alpha1.Task) bool {
+	for _, ref := range task.GetSpec().WorkspaceRefs() {
+		if ref.GetGoal() != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // templateEnvValue extracts a named container env var from an ActorTemplate,

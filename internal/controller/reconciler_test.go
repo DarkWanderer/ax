@@ -793,7 +793,8 @@ func TestNewNonCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
 	task := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
 		Spec: &v1alpha1.TaskSpec{
-			Env: []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Env:        []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces: []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 
@@ -806,6 +807,48 @@ func TestNewNonCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
 	}
 	if mock.actor != nil {
 		t.Fatalf("expected no actor to be provisioned, got %v", mock.actor)
+	}
+}
+
+// TestNewTaskWithNoGoalSurvivesModelSecretLookupFailure covers a brand-new
+// task with no workspace goal at all (e.g. command-only): the model API key
+// is only ever consumed by RunGoal, so a transient secret-lookup failure for
+// a task that was never going to need one must not block provisioning it.
+func TestNewTaskWithNoGoalSurvivesModelSecretLookupFailure(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		return "", errors.New("simulated transient secret store failure")
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			Image:   "example.invalid/runner",
+			Command: []string{"true"},
+		},
+	}
+
+	got, err := r.Reconcile(context.Background(), task)
+	if err != nil {
+		t.Fatalf("expected a goal-less task to be provisioned despite the model-secret lookup failure, got %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
 	}
 }
 
@@ -1055,6 +1098,49 @@ func TestCredentialedWorkspaceRejectsNonStandardPort(t *testing.T) {
 	ws443 := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "two"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com:443/repo/repo.git"}}}}
 	if _, err := r.ReconcileWithProvider(context.Background(), task, provider, ws443); err != nil {
 		t.Fatalf("explicit default port 443 must be accepted: %v", err)
+	}
+}
+
+// TestCredentialedWorkspaceRequiresContentsPermission covers a provider
+// granting only an unrelated GitHub App permission (e.g. "issues": "read")
+// for a repository it otherwise allow-lists by name. The minted installation
+// token would be scoped to that permission set and could never actually read
+// the repository, so strict workspace setup would exhaust its clone retries
+// and fail only after the task record is already immutable; this must be
+// rejected up front instead.
+func TestCredentialedWorkspaceRequiresContentsPermission(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"issues": "read"}}}}
+	task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: "https://github.com/org/repo.git"}}}}
+
+	_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
+	if err == nil || !strings.Contains(err.Error(), "contents") {
+		t.Fatalf("GitHub repository binding without contents permission was not rejected: %v", err)
+	}
+
+	// Granting contents access must then let it through.
+	provider.Spec.GithubApp.Permissions["contents"] = "read"
+	if _, err := r.ReconcileWithProvider(context.Background(), task, provider, ws); err != nil {
+		t.Fatalf("expected a binding to be accepted once contents permission is granted: %v", err)
 	}
 }
 
