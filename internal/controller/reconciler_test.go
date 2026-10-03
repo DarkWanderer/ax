@@ -763,6 +763,50 @@ func TestCredentialedWorkspaceRejectsCaseVariantSCPURL(t *testing.T) {
 	}
 }
 
+// TestCredentialedWorkspaceRejectsGenericSCPURL covers Git's generic scp-like
+// remote syntax, [user@]host:path (recognized whenever a colon precedes the
+// first slash with no "scheme://" present): only the conventional
+// "git@github.com:" spelling was rejected outright, but a bare
+// "github.com:org/repo.git" (no user) or one with a different user also
+// targets GitHub over SSH and must be rejected the same way, not fall through
+// url.Parse with no recognizable hostname and skip validation entirely.
+func TestCredentialedWorkspaceRejectsGenericSCPURL(t *testing.T) {
+	for _, remote := range []string{
+		"github.com:org/repo.git",
+		"alice@github.com:org/repo.git",
+		"GitHub.com:org/repo.git",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lis.Close()
+			mock := &mockControlServer{}
+			grpcServer := grpc.NewServer()
+			ateapipb.RegisterControlServer(grpcServer, mock)
+			go grpcServer.Serve(lis)
+			defer grpcServer.Stop()
+			client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+			r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) { return "private-key", nil }
+			r.InstallationTokens = &fakeInstallationTokens{}
+			provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"repo"}, Permissions: map[string]string{"contents": "read"}}}}
+			task := &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"}, Spec: &v1alpha1.TaskSpec{CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"}}}
+			ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "one"}, Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Repo: remote}}}}
+
+			_, err = r.ReconcileWithProvider(context.Background(), task, provider, ws)
+			if err == nil || !strings.Contains(err.Error(), "HTTPS") {
+				t.Fatalf("generic SCP-style remote %q was not rejected: %v", remote, err)
+			}
+		})
+	}
+}
+
 // TestCredentialedWorkspaceRejectsTrailingDotHostname covers the absolute-DNS
 // form "github.com." (a valid, distinct hostname string that Git and DNS both
 // still treat as github.com): without recognizing it before comparison, a

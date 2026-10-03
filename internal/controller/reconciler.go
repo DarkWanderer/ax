@@ -727,6 +727,15 @@ func (r *TaskReconciler) suspendAndRevokeWithRetry(atespace, actorName string) e
 	return lastErr
 }
 
+// scpLikeGitHubRemote matches Git's generic scp-like syntax ([user@]host:path,
+// recognized whenever a colon precedes the first slash and no "scheme://" is
+// present -- see git-clone(1)) when it targets github.com, with any or no
+// user, not just the conventional "git@github.com:" spelling (e.g. a bare
+// "github.com:org/private.git" or "alice@github.com:org/private.git" would
+// otherwise fall through url.Parse with no recognizable hostname and skip
+// GitHub-specific validation entirely).
+var scpLikeGitHubRemote = regexp.MustCompile(`(?i)^(?:[a-zA-Z0-9][a-zA-Z0-9._-]*@)?github\.com:`)
+
 func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, workspaces []*v1alpha1.Workspace) error {
 	allowed := make(map[string]bool)
 	for _, name := range provider.GetSpec().GetGithubApp().GetRepositories() {
@@ -736,7 +745,7 @@ func validateCredentialedWorkspaces(provider *v1alpha1.CredentialProvider, works
 		for _, repo := range ws.GetSpec().GetGit() {
 			raw := repo.GetRepo()
 			lower := strings.ToLower(raw)
-			if strings.HasPrefix(lower, "git@github.com:") || strings.HasPrefix(lower, "ssh://git@github.com/") {
+			if strings.HasPrefix(lower, "ssh://git@github.com/") || scpLikeGitHubRemote.MatchString(raw) {
 				return fmt.Errorf("credentialed GitHub repository must use HTTPS")
 			}
 			u, err := url.Parse(raw)
