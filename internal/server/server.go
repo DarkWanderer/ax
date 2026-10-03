@@ -219,7 +219,13 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
+		workspaces, err := s.fetchWorkspaces(ctx, atespace, task)
+		if err != nil {
+			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
+			task.Status.Phase = "Failed"
+			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
@@ -329,10 +335,23 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 	task.Status.Phase = "Suspended"
 
 	if s.reconciler != nil {
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
+		// A transient failure to resolve the workspaces or credential
+		// provider must not block an explicit suspend: the reconciler's
+		// suspendingExisting path (an already-provisioned actor) only needs
+		// the token already baked into that actor's template, not these, and
+		// a nil provider already behaves the same as an actually-deleted one.
+		// Blocking here would leave an already-running actor, with its live
+		// installation token, running indefinitely for lack of any
+		// background reconciliation to retry the suspend later.
+		workspaces, err := s.fetchWorkspaces(ctx, atespace, task)
+		if err != nil {
+			slog.Warn("workspace lookup failed while suspending task; proceeding without workspaces", "task", taskName, "error", err)
+			workspaces = nil
+		}
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			slog.Warn("credential provider lookup failed while suspending task; proceeding with suspension", "task", taskName, "error", err)
+			provider = nil
 		}
 		reconciled, err := s.reconciler.ReconcileWithProvider(ctx, task, provider, workspaces...)
 		if err != nil {
@@ -395,7 +414,12 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 			}
 			defer unlockProvider()
 		}
-		workspaces := s.fetchWorkspaces(ctx, atespace, task)
+		workspaces, err := s.fetchWorkspaces(ctx, atespace, task)
+		if err != nil {
+			task.Status.Phase = "Failed"
+			_ = s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status)
+			return nil, status.Errorf(codes.Internal, "%v", err)
+		}
 		provider, err := s.fetchCredentialProvider(ctx, atespace, task)
 		if err != nil {
 			task.Status.Phase = "Failed"
@@ -424,20 +448,28 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	return task, nil
 }
 
-func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1alpha1.Task) []*v1alpha1.Workspace {
+// fetchWorkspaces resolves every Workspace a task references. A lookup
+// failure (not found, or transient) is returned as an error rather than
+// silently omitting that binding: credential validation and the runner's
+// AX_WORKSPACES_YAML are both built from this slice, and a binding dropped
+// here would validate and launch as if it were never part of the task,
+// instead of resolving to the nil Workspace the runner would otherwise see.
+func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1alpha1.Task) ([]*v1alpha1.Workspace, error) {
 	var workspaces []*v1alpha1.Workspace
 	if task.Spec == nil {
-		return workspaces
+		return workspaces, nil
 	}
 	for _, ref := range task.Spec.WorkspaceRefs() {
 		if ref.Name == "" {
 			continue
 		}
-		if wsp, err := s.store.GetWorkspace(ctx, atespace, ref.Name); err == nil {
-			workspaces = append(workspaces, wsp)
+		wsp, err := s.store.GetWorkspace(ctx, atespace, ref.Name)
+		if err != nil {
+			return nil, fmt.Errorf("fetching workspace %s: %w", ref.Name, err)
 		}
+		workspaces = append(workspaces, wsp)
 	}
-	return workspaces
+	return workspaces, nil
 }
 
 // fetchCredentialProvider resolves the CredentialProvider a task's spec

@@ -301,6 +301,11 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 			// working credential at all, which is the correct, visible outcome
 			// for an OpenRouter-configured task missing its secret.
 			extraEnv[anthropicSecretKey] = ""
+			// Same reasoning: a task can also supply its own stale
+			// ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN in spec.env, which must not
+			// survive an authoritatively absent OpenRouter secret either.
+			extraEnv["ANTHROPIC_BASE_URL"] = ""
+			extraEnv["ANTHROPIC_AUTH_TOKEN"] = ""
 			openRouterKey, err := r.lookupSecret(ctx, atespace, openRouterSecretName, openRouterSecretKey)
 			secretLookupErr = err
 			if openRouterKey != "" {

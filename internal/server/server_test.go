@@ -340,6 +340,11 @@ type fakeReconciler struct {
 	// so a test can hold reconciliation open to probe what else can or
 	// cannot proceed concurrently with it.
 	release chan struct{}
+	// lastProvider and lastWorkspaces record the arguments of the most
+	// recent ReconcileWithProvider call, so a test can assert on what the
+	// caller resolved and passed through (e.g. nil on a lookup failure).
+	lastProvider   *v1alpha1.CredentialProvider
+	lastWorkspaces []*v1alpha1.Workspace
 }
 
 func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
@@ -348,6 +353,8 @@ func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 func (f *fakeReconciler) ReconcileWithProvider(ctx context.Context, task *v1alpha1.Task, provider *v1alpha1.CredentialProvider, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	f.reconcileCount++
+	f.lastProvider = provider
+	f.lastWorkspaces = workspaces
 	if f.started != nil {
 		f.startedOnce.Do(func() { close(f.started) })
 	}
@@ -708,5 +715,120 @@ func TestServer_DeleteTask_UpdateStatusError(t *testing.T) {
 	}
 	if rec.deleteCount != 0 {
 		t.Errorf("expected ReconcileDelete not to be called if UpdateTaskStatus fails, got %d calls", rec.deleteCount)
+	}
+}
+
+// failLookupStore injects a transient (non-NotFound) error from GetWorkspace
+// and/or GetCredentialProvider, simulating a store hiccup rather than the
+// referenced object genuinely being absent.
+type failLookupStore struct {
+	store.Store
+	failWorkspace string
+	failProvider  string
+}
+
+func (f *failLookupStore) GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error) {
+	if f.failWorkspace != "" && name == f.failWorkspace {
+		return nil, errors.New("simulated transient store failure")
+	}
+	return f.Store.GetWorkspace(ctx, atespace, name)
+}
+
+func (f *failLookupStore) GetCredentialProvider(ctx context.Context, atespace, name string) (*v1alpha1.CredentialProvider, error) {
+	if f.failProvider != "" && name == f.failProvider {
+		return nil, errors.New("simulated transient store failure")
+	}
+	return f.Store.GetCredentialProvider(ctx, atespace, name)
+}
+
+// TestCreateTask_FailsWhenWorkspaceLookupFails covers a workspace reference
+// that transiently fails to resolve: it must not be silently dropped from
+// the slice handed to credential validation and the reconciler, which would
+// let a credentialed task pass validation and launch missing the repository
+// that referenced workspace was supposed to provide.
+func TestCreateTask_FailsWhenWorkspaceLookupFails(t *testing.T) {
+	base := memory.NewStore()
+	if err := base.SaveWorkspace(context.Background(), &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "ws-a", Atespace: "default"},
+	}); err != nil {
+		t.Fatalf("SaveWorkspace: %v", err)
+	}
+	st := &failLookupStore{Store: base, failWorkspace: "ws-a"}
+	rec := &fakeReconciler{}
+	srv := server.NewServer(st, server.Options{Reconciler: rec})
+
+	_, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-ws-fail"},
+			Spec: &v1alpha1.TaskSpec{
+				Image:      "alpine",
+				Workspaces: []*v1alpha1.WorkspaceRef{{Name: "ws-a"}},
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected CreateTask to fail when a referenced workspace fails to resolve")
+	}
+	if rec.reconcileCount != 0 {
+		t.Errorf("expected ReconcileWithProvider not to be called with an incomplete workspace slice, got %d calls", rec.reconcileCount)
+	}
+}
+
+// TestSuspendTask_TransientLookupFailuresDoNotBlockSuspension covers a
+// SuspendTask whose workspace and credential-provider lookups transiently
+// fail: the reconciler's suspendingExisting path only needs the token
+// already baked into the existing actor's template, so a store hiccup must
+// not prevent the explicit suspend and leave the actor running indefinitely
+// with its live installation token (there is no background reconciliation
+// to retry the suspend later).
+func TestSuspendTask_TransientLookupFailuresDoNotBlockSuspension(t *testing.T) {
+	base := memory.NewStore()
+	if err := base.SaveWorkspace(context.Background(), &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "ws-a", Atespace: "default"},
+	}); err != nil {
+		t.Fatalf("SaveWorkspace: %v", err)
+	}
+	if err := base.SaveCredentialProvider(context.Background(), &v1alpha1.CredentialProvider{
+		Metadata: &v1alpha1.ObjectMeta{Name: "provider-a", Atespace: "default"},
+	}); err != nil {
+		t.Fatalf("SaveCredentialProvider: %v", err)
+	}
+	// Lookups succeed for the initial CreateTask, and only start failing
+	// (simulating a transient store hiccup) once the task already exists,
+	// so SuspendTask is the call under test.
+	st := &failLookupStore{Store: base}
+	rec := &fakeReconciler{}
+	srv := server.NewServer(st, server.Options{Reconciler: rec})
+
+	if _, err := srv.CreateTask(context.Background(), &v1alpha1.CreateTaskRequest{
+		Task: &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend"},
+			Spec: &v1alpha1.TaskSpec{
+				Image:              "alpine",
+				Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws-a"}},
+				CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "provider-a"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	st.failWorkspace = "ws-a"
+	st.failProvider = "provider-a"
+	task, err := srv.SuspendTask(context.Background(), &v1alpha1.SuspendTaskRequest{Name: "task-suspend"})
+	if err != nil {
+		t.Fatalf("expected SuspendTask to succeed despite transient lookup failures, got %v", err)
+	}
+	if task.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("returned phase = %q, want Suspended", task.GetStatus().GetPhase())
+	}
+	if rec.reconcileCount == 0 {
+		t.Fatal("expected ReconcileWithProvider to be called despite the transient lookup failures")
+	}
+	if rec.lastProvider != nil {
+		t.Errorf("expected nil provider to be passed through after its lookup failed, got %v", rec.lastProvider)
+	}
+	if len(rec.lastWorkspaces) != 0 {
+		t.Errorf("expected no workspaces to be passed through after the lookup failed, got %v", rec.lastWorkspaces)
 	}
 }

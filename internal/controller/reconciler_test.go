@@ -2594,6 +2594,8 @@ func TestOpenRouterSelectionClearsStaleAnthropicKeyWhenSecretAbsent(t *testing.T
 				{Name: "AX_GOAL_AGENT", Value: "claude"},
 				{Name: "AX_CLAUDE_PROVIDER", Value: "openrouter"},
 				{Name: "ANTHROPIC_API_KEY", Value: "stale-task-supplied-key"},
+				{Name: "ANTHROPIC_AUTH_TOKEN", Value: "stale-task-supplied-token"},
+				{Name: "ANTHROPIC_BASE_URL", Value: "https://stale.example.invalid"},
 			},
 		},
 	}
@@ -2610,7 +2612,10 @@ func TestOpenRouterSelectionClearsStaleAnthropicKeyWhenSecretAbsent(t *testing.T
 	if key, ok := env["ANTHROPIC_API_KEY"]; !ok || key != "" {
 		t.Errorf("ANTHROPIC_API_KEY = %q, want explicitly empty despite the missing OpenRouter secret, not the stale task-supplied value", key)
 	}
-	if env["ANTHROPIC_AUTH_TOKEN"] != "" {
-		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want unset since no OpenRouter key was resolved", env["ANTHROPIC_AUTH_TOKEN"])
+	if token, ok := env["ANTHROPIC_AUTH_TOKEN"]; !ok || token != "" {
+		t.Errorf("ANTHROPIC_AUTH_TOKEN = %q, want explicitly empty, not the stale task-supplied value", token)
+	}
+	if url, ok := env["ANTHROPIC_BASE_URL"]; !ok || url != "" {
+		t.Errorf("ANTHROPIC_BASE_URL = %q, want explicitly empty, not the stale task-supplied value", url)
 	}
 }
