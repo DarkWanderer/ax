@@ -16,7 +16,8 @@ The daemon speaks HTTP/1.1 and `h2c` on the same port. Your agent can introspect
 | Endpoint | Method | Returns | Description |
 |---|---|---|---|
 | `/healthz` | `GET` | `text/plain` | Liveness. Always `200 OK`. |
-| `/readyz` | `GET` | `text/plain` | Readiness. `503` while the workspace is initializing, `200` once clones, MCP config, and skills are in place. |
+| `/readyz` | `GET` | `text/plain` | Guest readiness. `200` as soon as the server is serving; this is Substrate's container probe. |
+| `/readyz?check=workspace` | `GET` | `text/plain` | Workspace readiness. `503` while the workspace is initializing, `200` once clones, MCP config, and skills are in place. |
 | `/metadata/v1alpha1/ax/task` | `GET` | `application/yaml` | Task launch configuration, excluding status. |
 | `/metadata/v1alpha1/ax/workspaces` | `GET` | `application/yaml` | Every bound `Workspace`, as a multi-document stream in binding order. |
 

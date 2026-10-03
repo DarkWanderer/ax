@@ -206,6 +206,12 @@ func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName st
 const (
 	DefaultGuestCommand    = "/usr/local/bin/ax-task-runner"
 	DefaultSnapshotsBucket = "gs://dberkov-gke-dev3/ate-env/"
+
+	// readyzTimeout bounds how long Substrate polls the guest probe before
+	// failing actor start; its 30s default is too tight for slow guest
+	// startup. The probe no longer waits on workspace setup, so this is
+	// headroom rather than clone time.
+	readyzTimeout = 5 * time.Minute
 )
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
@@ -250,6 +256,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 					Path: "/readyz",
 					Port: 80,
 				},
+				TimeoutSeconds: int32(readyzTimeout / time.Second),
 			},
 			VolumeMounts: []*ateapipb.VolumeMount{{
 				Name:      "workspace",

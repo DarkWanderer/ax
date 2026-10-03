@@ -182,14 +182,22 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok\n"))
 }
 
+// handleReadyz serves two readiness levels. Plain /readyz is the guest probe
+// Substrate uses to decide the container started; it only needs the server to
+// be serving. Substrate opens sandbox egress after it passes, and workspace
+// setup (clones, goal agent) needs that egress, so gating the plain probe on
+// the workspace would deadlock the two. /readyz?check=workspace is what AX's
+// controller polls and reports 503 until the workspace is prepared.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
-	s.mu.RLock()
-	ready := s.workspaceReady
-	s.mu.RUnlock()
+	if r.URL.Query().Get("check") == "workspace" {
+		s.mu.RLock()
+		ready := s.workspaceReady
+		s.mu.RUnlock()
 
-	if !ready {
-		http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
-		return
+		if !ready {
+			http.Error(w, "workspace initializing", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)

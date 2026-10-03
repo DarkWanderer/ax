@@ -82,25 +82,32 @@ func TestMetadataServer(t *testing.T) {
 		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
 	}
 
-	// Test /readyz before workspace ready
-	resp, err = http.Get("http://127.0.0.1:9999/readyz")
-	if err != nil {
-		t.Fatalf("readyz request failed: %v", err)
+	get := func(url string) int {
+		t.Helper()
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", url, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
 	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 Service Unavailable before setup, got %d", resp.StatusCode)
+	const readyz = "http://127.0.0.1:9999/readyz"
+
+	// Guest readiness (Substrate's probe) must not wait for the workspace.
+	if got := get(readyz); got != http.StatusOK {
+		t.Fatalf("expected 200 OK from plain /readyz before setup, got %d", got)
+	}
+	if got := get(readyz + "?check=workspace"); got != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 from workspace readyz before setup, got %d", got)
 	}
 
-	// Mark workspace ready
 	srv.SetWorkspaceReady(true)
 
-	// Test /readyz after workspace ready
-	resp, err = http.Get("http://127.0.0.1:9999/readyz")
-	if err != nil {
-		t.Fatalf("readyz request failed: %v", err)
+	if got := get(readyz + "?check=workspace"); got != http.StatusOK {
+		t.Fatalf("expected 200 from workspace readyz after setup, got %d", got)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK after setup, got %d", resp.StatusCode)
+	if got := get(readyz); got != http.StatusOK {
+		t.Fatalf("expected 200 OK from plain /readyz after setup, got %d", got)
 	}
 
 	// Test /metadata/v1alpha1/ax/task
