@@ -745,6 +745,7 @@ func TestNewCredentialedTaskAbortsWhenModelSecretLookupFails(t *testing.T) {
 		Spec: &v1alpha1.TaskSpec{
 			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
 			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 	got, err := r.ReconcileWithProvider(context.Background(), task, provider)
@@ -849,6 +850,125 @@ func TestNewTaskWithNoGoalSurvivesModelSecretLookupFailure(t *testing.T) {
 	}
 	if got.GetStatus().GetPhase() != "Suspended" {
 		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+}
+
+// TestCredentialedCommandOnlyTaskSurvivesModelSecretLookupFailure covers a
+// credentialed (CredentialProvider-bound) but goal-less, command-only task
+// whose GitHub token is rotated (forcing a template switch) in the same
+// round its unrelated model-secret lookup fails transiently. taskHasGoal
+// bypasses the brand-new-actor check for this task, but the credential
+// carry-forward/required-key logic must also be skipped entirely: neither
+// an unreadable previous template nor a previous template missing the model
+// key should block provisioning a task that was never going to run a goal.
+func TestCredentialedCommandOnlyTaskSurvivesModelSecretLookupFailure(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	r.SecretResolver = func(_ context.Context, _, name, _ string) (string, error) {
+		if name == "key" {
+			return "private-key", nil
+		}
+		return "", errors.New("simulated transient secret store failure")
+	}
+	r.InstallationTokens = &fakeInstallationTokens{}
+	provider := &v1alpha1.CredentialProvider{Metadata: &v1alpha1.ObjectMeta{Name: "github", Atespace: "team"}, Spec: &v1alpha1.CredentialProviderSpec{GithubApp: &v1alpha1.GitHubAppCredential{AppId: 1, InstallationId: 2, PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "key", Key: "pem"}, Repositories: []string{"one"}, Permissions: map[string]string{"contents": "read"}}}}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			Image:              "example.invalid/runner",
+			Command:            []string{"true"},
+			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
+		},
+	}
+
+	got, err := r.ReconcileWithProvider(context.Background(), task, provider)
+	if err != nil {
+		t.Fatalf("expected a command-only credentialed task to be provisioned despite the model-secret lookup failure, got %v", err)
+	}
+	if got.GetStatus().GetPhase() != "Suspended" {
+		t.Fatalf("phase = %q, want Suspended", got.GetStatus().GetPhase())
+	}
+}
+
+// TestNonCredentialedResumeFailsClosedWhenActorNeverHadModelCredential covers
+// a non-credential-provider task created while its model secret was
+// authoritatively absent: its actor exists, but its template never carried a
+// model credential. existingActor is only ever populated for ref != nil
+// tasks, so a naive check would see a nil existingActor here and skip the
+// fail-closed path entirely; the actual actor must be looked up directly and
+// its current template inspected.
+func TestNonCredentialedResumeFailsClosedWhenActorNeverHadModelCredential(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	mock := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mock)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	r := controller.NewTaskReconciler(client, "test-template", "ax-system")
+	r.WorkspaceReadyTimeout = 50 * time.Millisecond
+	lookupFails := false
+	r.SecretResolver = func(_ context.Context, _, _, _ string) (string, error) {
+		if lookupFails {
+			return "", errors.New("simulated transient secret store failure")
+		}
+		// Authoritatively absent throughout creation.
+		return "", nil
+	}
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "job", Atespace: "team"},
+		Spec: &v1alpha1.TaskSpec{
+			Image:      "example.invalid/runner",
+			Env:        []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces: []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
+		},
+	}
+
+	// Create (starts Suspended), then resume: both succeed, but the actor's
+	// template never gets a model credential since the secret is
+	// authoritatively absent throughout.
+	if _, err := r.Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	task.Status.Phase = "Running"
+	if _, err := r.Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	// Suspend, then resume again while the lookup now fails transiently
+	// instead of being authoritatively absent.
+	task.Status.Phase = "Suspended"
+	if _, err := r.Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	lookupFails = true
+	task.Status.Phase = "Running"
+	got, err := r.Reconcile(context.Background(), task)
+	if err == nil || got.GetStatus().GetPhase() != "Failed" {
+		t.Fatalf("expected resume to fail when the already-provisioned actor never had a model credential and its pending goal has none to recover: task=%v err=%v", got, err)
 	}
 }
 
@@ -2342,6 +2462,7 @@ func TestCredentialedActorSwitchesTemplateDespiteTransientModelSecretFailure(t *
 		Spec: &v1alpha1.TaskSpec{
 			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
 			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 
@@ -2469,6 +2590,7 @@ func TestCredentialedTemplateCarryForwardOverwritesStaleTaskSuppliedSecret(t *te
 		Spec: &v1alpha1.TaskSpec{
 			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
 			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 
@@ -2559,6 +2681,7 @@ func TestCredentialedRotationAbortsWhenOldTemplateNeverHadCredential(t *testing.
 		Spec: &v1alpha1.TaskSpec{
 			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
 			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 
@@ -2629,6 +2752,7 @@ func TestCredentialedRotationAbortsWhenOldTemplateUnreadable(t *testing.T) {
 		Spec: &v1alpha1.TaskSpec{
 			CredentialProvider: &v1alpha1.CredentialProviderRef{Name: "github"},
 			Env:                []*v1alpha1.EnvVar{{Name: "AX_GOAL_AGENT", Value: "claude"}},
+			Workspaces:         []*v1alpha1.WorkspaceRef{{Name: "ws", Goal: "do something"}},
 		},
 	}
 

@@ -345,38 +345,48 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 		// down), so a stale task-supplied value must not win over the
 		// template's last known-working one just because it happened to
 		// already be non-empty.
-		actorAlreadyProvisioned := existingActor != nil
-		if !actorAlreadyProvisioned && ref == nil {
-			// existingActor above is only ever populated when ref != nil
-			// (credentialed tasks): a non-credentialed task reaching this
-			// point always sees a nil existingActor regardless of whether
-			// its actor already exists, so that alone can't tell a brand-new
-			// actor apart from an already-provisioned one being resumed or
-			// re-suspended. Check directly.
-			if _, err := r.client.GetActor(ctx, atespace, actorName); err == nil {
-				actorAlreadyProvisioned = true
+		// existingActor above is only ever populated when ref != nil
+		// (credentialed tasks): a non-credentialed task reaching this point
+		// always sees a nil existingActor regardless of whether its actor
+		// already exists, so that alone can't tell a brand-new actor apart
+		// from an already-provisioned one being resumed or re-suspended.
+		// Check directly and use whatever actor object this finds for the
+		// credential checks below, which need its current template either
+		// way.
+		provisionedActor := existingActor
+		if provisionedActor == nil && ref == nil {
+			if actor, err := r.client.GetActor(ctx, atespace, actorName); err == nil {
+				provisionedActor = actor
 			}
 		}
-		if !actorAlreadyProvisioned && taskHasGoal(task) {
-			// A brand-new actor has no previous template to carry a model
-			// credential forward from: proceeding would provision it running
-			// a goal it has no model credential to actually execute, and
-			// nothing will ever retry this since there is no background
-			// reconciliation. Fail now, before the actor exists. This does
-			// not depend on newToken: a task with no CredentialProvider at
-			// all (newToken always "") is just as new, and just as unable to
-			// run its goal without a model credential, as a credentialed one.
-			// It also doesn't apply to a task with no goal at all (e.g.
-			// command-only): the model credential is only ever consumed by
-			// RunGoal, so an unrelated secret-store outage must not block
-			// provisioning a task that was never going to need it.
-			if newToken != "" {
-				r.revokeForCleanup(newToken)
+		// The model API key is only ever consumed by RunGoal: a command-only
+		// task (no workspace goal anywhere) never needs one, so an unrelated
+		// secret-store outage must not block provisioning or resuming it.
+		if taskHasGoal(task) {
+			if provisionedActor == nil {
+				// A brand-new actor has no previous template to carry a
+				// model credential forward from: proceeding would provision
+				// it running a goal it has no model credential to actually
+				// execute, and nothing will ever retry this since there is
+				// no background reconciliation. Fail now, before the actor
+				// exists. This does not depend on newToken: a task with no
+				// CredentialProvider at all (newToken always "") is just as
+				// new, and just as unable to run its goal without a model
+				// credential, as a credentialed one.
+				if newToken != "" {
+					r.revokeForCleanup(newToken)
+				}
+				return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key for new task: %v", secretLookupErr), now)
 			}
-			return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key for new task: %v", secretLookupErr), now)
-		}
-		if newToken != "" {
-			oldTmpl, err := r.client.GetActorTemplate(ctx, existingActor.GetActorTemplate().GetAtespace(), existingActor.GetActorTemplate().GetName())
+			// An already-provisioned actor needs its *current* template
+			// checked regardless of newToken: a GitHub token rotation
+			// (newToken != "") is about to force a replacement template, so
+			// the credential must be carried into it, but even without a
+			// rotation the actor may have been created, or last resumed,
+			// while this secret was authoritatively absent -- its current
+			// template never held the credential either -- and resuming it
+			// now would let RunGoal silently skip the configured goal.
+			oldTmpl, err := r.client.GetActorTemplate(ctx, provisionedActor.GetActorTemplate().GetAtespace(), provisionedActor.GetActorTemplate().GetName())
 			if err != nil {
 				// Proceeding here would build and apply a replacement template
 				// missing the model credential, with no way to carry it
@@ -384,7 +394,9 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 				// hasn't been touched yet this round and so remains on its
 				// current (if GitHub-token-stale) template rather than one
 				// that's also missing its model credential.
-				r.revokeForCleanup(newToken)
+				if newToken != "" {
+					r.revokeForCleanup(newToken)
+				}
 				return r.credentialFailure(task, fmt.Sprintf("could not read previous actor template to carry its model credential forward: %v", err), now)
 			}
 			for _, key := range []string{anthropicSecretKey, "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", geminiSecretKey} {
@@ -409,7 +421,9 @@ func (r *TaskReconciler) ReconcileWithProvider(ctx context.Context, task *v1alph
 				}
 			}
 			if extraEnv[requiredKey] == "" {
-				r.revokeForCleanup(newToken)
+				if newToken != "" {
+					r.revokeForCleanup(newToken)
+				}
 				return r.credentialFailure(task, fmt.Sprintf("could not resolve model API key and no prior credential available to carry forward: %v", secretLookupErr), now)
 			}
 		}

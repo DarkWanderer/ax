@@ -234,11 +234,45 @@ func ValidateCredentialProvider(p *CredentialProvider) error {
 		return fmt.Errorf("spec.githubApp.permissions: at least one permission is required")
 	}
 	for name, level := range app.GetPermissions() {
-		if name == "" || (level != "read" && level != "write") {
+		if !githubAppRepositoryPermissions[name] {
+			return fmt.Errorf("spec.githubApp.permissions: unknown permission %q", name)
+		}
+		if level != "read" && level != "write" {
 			return fmt.Errorf("spec.githubApp.permissions: invalid permission %q=%q (must be \"read\" or \"write\")", name, level)
 		}
 	}
 	return nil
+}
+
+// githubAppRepositoryPermissions lists the repository-level permission keys
+// GitHub's installation-token endpoint accepts (as opposed to organization-
+// level permissions, not applicable here since this provider is scoped to
+// specific repositories via spec.githubApp.repositories). An unrecognized
+// key would be accepted here but rejected by GitHub only once the first
+// credentialed task using this provider tries to mint a token from its
+// already-immutable record, instead of failing to apply the provider itself.
+var githubAppRepositoryPermissions = map[string]bool{
+	"actions":                      true,
+	"administration":               true,
+	"checks":                       true,
+	"contents":                     true,
+	"deployments":                  true,
+	"environments":                 true,
+	"issues":                       true,
+	"metadata":                     true,
+	"packages":                     true,
+	"pages":                        true,
+	"pull_requests":                true,
+	"repository_custom_properties": true,
+	"repository_hooks":             true,
+	"repository_projects":          true,
+	"secret_scanning_alerts":       true,
+	"secrets":                      true,
+	"security_events":              true,
+	"single_file":                  true,
+	"statuses":                     true,
+	"vulnerability_alerts":         true,
+	"workflows":                    true,
 }
 
 // Workspace bindings.

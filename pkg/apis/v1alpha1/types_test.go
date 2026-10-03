@@ -56,6 +56,13 @@ func TestCredentialProviderValidation(t *testing.T) {
 		{"uppercase secret name", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Name = "App-Key" }},
 		{"slash in secret name", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Name = "app/key" }},
 		{"jsonpath metacharacter in secret key", func(p *v1alpha1.CredentialProvider) { p.Spec.GithubApp.PrivateKeySecret.Key = "pem']" }},
+		// GitHub's installation-token endpoint rejects unknown permission
+		// keys; accepting a typo like "contentz" here would only surface the
+		// problem once the first credentialed task using this provider is
+		// already an immutable record.
+		{"unknown permission name", func(p *v1alpha1.CredentialProvider) {
+			p.Spec.GithubApp.Permissions = map[string]string{"contentz": "read"}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := valid()
