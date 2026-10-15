@@ -15,6 +15,7 @@
 package v1alpha1_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -593,5 +594,411 @@ func TestValidateWorkspace_Files(t *testing.T) {
 	}
 	if err := v1alpha1.ValidateWorkspace(ws); err == nil || !strings.Contains(err.Error(), "spec.files[0]: path is required") {
 		t.Errorf("expected path is required error, got %v", err)
+	}
+}
+
+func validGitHubApp() *v1alpha1.Credential {
+	return &v1alpha1.Credential{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindCredential,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "gh", Atespace: "default"},
+		Spec: &v1alpha1.CredentialSpec{Type: &v1alpha1.CredentialSpec_GithubApp{GithubApp: &v1alpha1.GitHubAppCredential{
+			AppId: 1, InstallationId: 2,
+			PrivateKeySecret: &v1alpha1.SecretKeyRef{Name: "app-key", Key: "pem"},
+			Repositories:     []string{"one", "two"},
+			Permissions:      map[string]string{"contents": "read"},
+		}}},
+	}
+}
+
+func validOAuthAccess() *v1alpha1.Credential {
+	return &v1alpha1.Credential{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindCredential,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "claude", Atespace: "default"},
+		Spec: &v1alpha1.CredentialSpec{Type: &v1alpha1.CredentialSpec_OauthAccessToken{OauthAccessToken: &v1alpha1.OAuthAccessTokenCredential{
+			TokenSecret: &v1alpha1.SecretKeyRef{Name: "claude-oauth", Key: "token"},
+		}}},
+	}
+}
+
+func validOAuthRefresh() *v1alpha1.Credential {
+	return &v1alpha1.Credential{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindCredential,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "idp", Atespace: "default"},
+		Spec: &v1alpha1.CredentialSpec{Type: &v1alpha1.CredentialSpec_OauthRefreshToken{OauthRefreshToken: &v1alpha1.OAuthRefreshTokenCredential{
+			TokenUrl:           "https://idp.example.com/oauth/token",
+			ClientId:           "client",
+			ClientSecret:       &v1alpha1.SecretKeyRef{Name: "idp", Key: "client-secret"},
+			Scopes:             []string{"repo", "read:user"},
+			RefreshTokenSecret: &v1alpha1.SecretKeyRef{Name: "idp", Key: "refresh-token"},
+			RevocationUrl:      "https://idp.example.com/oauth/revoke",
+		}}},
+	}
+}
+
+func TestCredential_RoundTrip(t *testing.T) {
+	for name, want := range map[string]*v1alpha1.Credential{
+		"githubApp":         validGitHubApp(),
+		"oauthAccessToken":  validOAuthAccess(),
+		"oauthRefreshToken": validOAuthRefresh(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := yaml.Marshal(want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(out), name+":") {
+				t.Errorf("expected %q key in output:\n%s", name, out)
+			}
+			var got v1alpha1.Credential
+			if err := yaml.Unmarshal(out, &got); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, out)
+			}
+			if !proto.Equal(want, &got) {
+				t.Errorf("credential round trip changed:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestCredential_UnmarshalYAML(t *testing.T) {
+	const manifest = `
+apiVersion: ax.io/v1alpha1
+kind: Credential
+metadata:
+  name: claude
+spec:
+  oauthAccessToken:
+    tokenSecret:
+      name: claude-oauth
+      key: token
+`
+	var c v1alpha1.Credential
+	if err := yaml.Unmarshal([]byte(manifest), &c); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.GetSpec().GetOauthAccessToken().GetTokenSecret().GetName(); got != "claude-oauth" {
+		t.Errorf("token secret name = %q", got)
+	}
+	if err := v1alpha1.ValidateCredential(&c); err != nil {
+		t.Errorf("manifest should be valid: %v", err)
+	}
+}
+
+func TestCredential_TwoTypesIsDecodeError(t *testing.T) {
+	const manifest = `
+apiVersion: ax.io/v1alpha1
+kind: Credential
+metadata:
+  name: both
+spec:
+  oauthAccessToken:
+    tokenSecret: {name: a, key: b}
+  githubApp:
+    appId: 1
+`
+	var c v1alpha1.Credential
+	if err := yaml.Unmarshal([]byte(manifest), &c); err == nil {
+		t.Fatal("expected an error when two credential types are set")
+	}
+}
+
+func TestCredential_StrictDecoding(t *testing.T) {
+	var c v1alpha1.Credential
+	err := yaml.Unmarshal([]byte("kind: Credential\nmetadata: {name: x}\nspec:\n  oauthAccessToken:\n    tokenSecert: {name: a, key: b}\n"), &c)
+	if err == nil {
+		t.Fatal("expected a misspelled field to be rejected")
+	}
+}
+
+func TestValidateCredential(t *testing.T) {
+	tests := []struct {
+		name    string
+		cred    func() *v1alpha1.Credential
+		change  func(*v1alpha1.Credential)
+		wantErr string
+	}{
+		{name: "github app", cred: validGitHubApp},
+		{name: "oauth access token", cred: validOAuthAccess},
+		{name: "oauth refresh token", cred: validOAuthRefresh},
+		{
+			name: "oauth refresh token without client secret", cred: validOAuthRefresh,
+			change: func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().ClientSecret = nil },
+		},
+		{
+			name: "oauth refresh token without revocation url", cred: validOAuthRefresh,
+			change: func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().RevocationUrl = "" },
+		},
+		{
+			name: "missing name", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Metadata.Name = "" },
+			wantErr: "metadata.name",
+		},
+		{
+			name: "invalid name", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Metadata.Name = "Not_Valid" },
+			wantErr: "metadata.name",
+		},
+		{
+			name: "nil spec", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec = nil },
+			wantErr: "spec: exactly one credential type",
+		},
+		{
+			name: "no type", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec = &v1alpha1.CredentialSpec{} },
+			wantErr: "spec: exactly one credential type",
+		},
+
+		// githubApp
+		{
+			name: "github missing app id", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().AppId = 0 },
+			wantErr: "appId",
+		},
+		{
+			name: "github negative installation id", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().InstallationId = -1 },
+			wantErr: "installationId",
+		},
+		{
+			name: "github missing key secret", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().PrivateKeySecret = nil },
+			wantErr: "spec.githubApp.privateKeySecret",
+		},
+		{
+			name: "github no repositories", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().Repositories = nil },
+			wantErr: "repositories: must contain 1 to 500",
+		},
+		{
+			name: "github too many repositories", cred: validGitHubApp,
+			change: func(c *v1alpha1.Credential) {
+				g := c.Spec.GetGithubApp()
+				g.Repositories = nil
+				for i := 0; i < 501; i++ {
+					g.Repositories = append(g.Repositories, fmt.Sprintf("repo-%d", i))
+				}
+			},
+			wantErr: "repositories: must contain 1 to 500",
+		},
+		{
+			name: "github duplicate repository", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().Repositories = []string{"one", "one"} },
+			wantErr: "invalid or duplicate",
+		},
+		{
+			name: "github case-folded duplicate repository", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().Repositories = []string{"One", "one"} },
+			wantErr: "invalid or duplicate",
+		},
+		{
+			name: "github repository with owner", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().Repositories = []string{"org/repo"} },
+			wantErr: "invalid or duplicate",
+		},
+		{
+			name: "github no permissions", cred: validGitHubApp,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetGithubApp().Permissions = nil },
+			wantErr: "at least one permission",
+		},
+		{
+			name: "github unknown permission", cred: validGitHubApp,
+			change: func(c *v1alpha1.Credential) {
+				c.Spec.GetGithubApp().Permissions = map[string]string{"contentz": "read"}
+			},
+			wantErr: `unknown permission "contentz"`,
+		},
+		{
+			name: "github bad permission level", cred: validGitHubApp,
+			change: func(c *v1alpha1.Credential) {
+				c.Spec.GetGithubApp().Permissions = map[string]string{"contents": "admin"}
+			},
+			wantErr: "must be \"read\" or \"write\"",
+		},
+
+		// secret references
+		{
+			name: "uppercase secret name", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthAccessToken().TokenSecret.Name = "App-Key" },
+			wantErr: "spec.oauthAccessToken.tokenSecret.name",
+		},
+		{
+			name: "slash in secret name", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthAccessToken().TokenSecret.Name = "app/key" },
+			wantErr: "spec.oauthAccessToken.tokenSecret.name",
+		},
+		{
+			name: "jsonpath metacharacter in secret key", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthAccessToken().TokenSecret.Key = "tok']" },
+			wantErr: "spec.oauthAccessToken.tokenSecret.key",
+		},
+		{
+			name: "missing token secret", cred: validOAuthAccess,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthAccessToken().TokenSecret = nil },
+			wantErr: "spec.oauthAccessToken.tokenSecret",
+		},
+		{
+			name: "dotted secret name is a valid DNS subdomain", cred: validOAuthAccess,
+			change: func(c *v1alpha1.Credential) { c.Spec.GetOauthAccessToken().TokenSecret.Name = "github.app-key" },
+		},
+
+		// oauthRefreshToken
+		{
+			name: "refresh token http token url", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().TokenUrl = "http://idp.example.com/token" },
+			wantErr: "spec.oauthRefreshToken.tokenUrl",
+		},
+		{
+			name: "refresh token missing token url", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().TokenUrl = "" },
+			wantErr: "spec.oauthRefreshToken.tokenUrl",
+		},
+		{
+			name: "refresh token url without host", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().TokenUrl = "https:///token" },
+			wantErr: "spec.oauthRefreshToken.tokenUrl",
+		},
+		{
+			name: "refresh token http revocation url", cred: validOAuthRefresh,
+			change: func(c *v1alpha1.Credential) {
+				c.Spec.GetOauthRefreshToken().RevocationUrl = "http://idp.example.com/revoke"
+			},
+			wantErr: "spec.oauthRefreshToken.revocationUrl",
+		},
+		{
+			name: "refresh token missing client id", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().ClientId = "" },
+			wantErr: "spec.oauthRefreshToken.clientId",
+		},
+		{
+			name: "refresh token missing seed secret", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().RefreshTokenSecret = nil },
+			wantErr: "spec.oauthRefreshToken.refreshTokenSecret",
+		},
+		{
+			name: "refresh token invalid client secret ref", cred: validOAuthRefresh,
+			change:  func(c *v1alpha1.Credential) { c.Spec.GetOauthRefreshToken().ClientSecret.Key = "" },
+			wantErr: "spec.oauthRefreshToken.clientSecret",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := tt.cred()
+			if tt.change != nil {
+				tt.change(c)
+			}
+			err := v1alpha1.ValidateCredential(c)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCredentialType(t *testing.T) {
+	for want, c := range map[string]*v1alpha1.Credential{
+		"githubApp":         validGitHubApp(),
+		"oauthAccessToken":  validOAuthAccess(),
+		"oauthRefreshToken": validOAuthRefresh(),
+		"":                  {},
+	} {
+		if got := v1alpha1.CredentialType(c.GetSpec()); got != want {
+			t.Errorf("CredentialType = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestValidateTask_Credentials(t *testing.T) {
+	bind := func(pairs ...string) []*v1alpha1.CredentialBinding {
+		var out []*v1alpha1.CredentialBinding
+		for i := 0; i < len(pairs); i += 2 {
+			out = append(out, &v1alpha1.CredentialBinding{Name: pairs[i], Env: pairs[i+1]})
+		}
+		return out
+	}
+	tests := []struct {
+		name    string
+		spec    *v1alpha1.TaskSpec
+		wantErr string
+	}{
+		{name: "one binding", spec: &v1alpha1.TaskSpec{Credentials: bind("claude", "CLAUDE_CODE_OAUTH_TOKEN")}},
+		{name: "two bindings", spec: &v1alpha1.TaskSpec{Credentials: bind("gh", "GITHUB_TOKEN", "claude", "CLAUDE_CODE_OAUTH_TOKEN")}},
+		{name: "underscore env", spec: &v1alpha1.TaskSpec{Credentials: bind("gh", "_TOKEN_1")}},
+		{
+			name:    "missing credential name",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("", "GITHUB_TOKEN")},
+			wantErr: "spec.credentials[0].name",
+		},
+		{
+			name:    "invalid credential name",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("Not_Valid", "GITHUB_TOKEN")},
+			wantErr: "spec.credentials[0].name",
+		},
+		{
+			name:    "missing env",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "")},
+			wantErr: "spec.credentials[0].env",
+		},
+		{
+			name:    "env starting with a digit",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "1TOKEN")},
+			wantErr: "spec.credentials[0].env",
+		},
+		{
+			name:    "env with dash",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "GITHUB-TOKEN")},
+			wantErr: "spec.credentials[0].env",
+		},
+		{
+			name:    "env with equals sign",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "A=B")},
+			wantErr: "spec.credentials[0].env",
+		},
+		{
+			name:    "reserved AX_ prefix",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "AX_TASK_YAML")},
+			wantErr: `must not start with "AX_"`,
+		},
+		{
+			name:    "duplicate env",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "TOKEN", "claude", "TOKEN")},
+			wantErr: `env "TOKEN" is already used by credential "gh"`,
+		},
+		{
+			name: "env collides with spec.env",
+			spec: &v1alpha1.TaskSpec{
+				Env:         []*v1alpha1.EnvVar{{Name: "GITHUB_TOKEN", Value: "manual"}},
+				Credentials: bind("gh", "GITHUB_TOKEN"),
+			},
+			wantErr: `env "GITHUB_TOKEN" collides with spec.env`,
+		},
+		{
+			name:    "same credential bound twice to different envs is fine",
+			spec:    &v1alpha1.TaskSpec{Credentials: bind("gh", "GH_TOKEN", "gh", "GITHUB_TOKEN")},
+			wantErr: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := v1alpha1.ValidateTask(&v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "task"}, Spec: tt.spec})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }

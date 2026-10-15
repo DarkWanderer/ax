@@ -121,6 +121,9 @@ func TestRunGetResourceAliases(t *testing.T) {
 		if err := s.SaveModel(context.Background(), &v1alpha1.Model{Metadata: meta}); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.SaveCredential(context.Background(), &v1alpha1.Credential{Metadata: meta}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -131,7 +134,7 @@ func TestRunGetResourceAliases(t *testing.T) {
 	t.Cleanup(srv.Stop)
 	go func() { _ = srv.Serve(listener) }()
 
-	for _, resource := range []string{"task", "workspace", "model"} {
+	for _, resource := range []string{"task", "workspace", "model", "credential"} {
 		for _, alias := range []string{resource, resource + "s"} {
 			for _, tc := range []struct {
 				name         string
@@ -215,7 +218,7 @@ type fakeMainReconciler struct {
 	deleted chan struct{}
 }
 
-func (f *fakeMainReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+func (f *fakeMainReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, creds []*v1alpha1.Credential) (*v1alpha1.Task, error) {
 	return task, nil
 }
 

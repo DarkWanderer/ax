@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/credentials"
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -51,6 +53,11 @@ const (
 	// resumed actor to finish workspace setup.
 	defaultWorkspaceReadyTimeout = 15 * time.Second
 	workspaceReadyPollInterval   = 500 * time.Millisecond
+	// credentialRevokeTimeout bounds revoking tokens whose template could not be created.
+	credentialRevokeTimeout = 10 * time.Second
+	// reasonCredentialIssueFailed is the Ready condition reason when a task's
+	// credentials could not be put into its ActorTemplate.
+	reasonCredentialIssueFailed = "CredentialIssueFailed"
 )
 
 // SecretResolver looks up a key from a Kubernetes secret in the given namespace.
@@ -71,6 +78,11 @@ type TaskReconciler struct {
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
+
+	// Credentials issues the tokens of the credentials a task binds. It is only
+	// needed while a task's ActorTemplate is being created: a template that
+	// already exists holds its tokens.
+	Credentials *credentials.Service
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -91,8 +103,10 @@ func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplat
 	}
 }
 
-// Reconcile handles the reconciliation loop for a single Task.
-func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+// Reconcile handles the reconciliation loop for a single Task. creds are the
+// credentials the task binds; one that is missing from creds is an error only
+// when the task's ActorTemplate has to be created.
+func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, creds []*v1alpha1.Credential) (*v1alpha1.Task, error) {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
 	}
@@ -175,12 +189,32 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
+		bindings := task.Spec.GetCredentials()
+		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv, bindings)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
-		if err != nil {
-			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
-		} else if tmpl != nil && tmpl.Metadata != nil {
+		var tmpl *ateapipb.ActorTemplate
+		var err error
+		if len(bindings) > 0 {
+			tmpl, err = r.ensureCredentialedTemplate(ctx, task, creds, templateAtespace, templateName, atespace, customTemplateName, extraEnv)
+			if err != nil {
+				// The default template would start the task without its
+				// credentials and let it fail later in a harder-to-diagnose way.
+				r.setNotReady(task, reasonCredentialIssueFailed, err.Error(), now)
+				// A timeout or an unavailable Substrate says nothing about the
+				// credentials, so the task stays retryable like in the other steps.
+				task.Status.Phase = "Failed"
+				if substrate.IsTransientError(err) {
+					task.Status.Phase = "Pending"
+				}
+				return task, fmt.Errorf("preparing task credentials: %w", err)
+			}
+		} else {
+			tmpl, err = r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
+			if err != nil {
+				slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
+			}
+		}
+		if err == nil && tmpl != nil && tmpl.Metadata != nil {
 			templateAtespace = tmpl.Metadata.Atespace
 			templateName = tmpl.Metadata.Name
 			slog.Info("using custom ActorTemplate for actor", "templateAtespace", templateAtespace, "templateName", templateName)
@@ -382,8 +416,10 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, env map[string]string) string {
+// digest of the image, the container environment and the credential bindings, so a
+// spec change yields a new template. Token values are deliberately not part of the
+// digest: they change on every issue, and the template must stay put once created.
+func taskTemplateName(taskName, image string, env map[string]string, bindings []*v1alpha1.CredentialBinding) string {
 	h := sha256.New()
 	h.Write([]byte(image))
 	keys := make([]string, 0, len(env))
@@ -394,7 +430,112 @@ func taskTemplateName(taskName, image string, env map[string]string) string {
 	for _, k := range keys {
 		h.Write([]byte(k + "=" + env[k] + ";"))
 	}
+	// Written only when there are bindings, so the name of a task without any is
+	// the one it had before credentials existed and no template is recreated.
+	pairs := make([]string, 0, len(bindings))
+	for _, b := range bindings {
+		pairs = append(pairs, b.GetName()+"\x00"+b.GetEnv())
+	}
+	sort.Strings(pairs)
+	for _, p := range pairs {
+		h.Write([]byte("credential:" + p + ";"))
+	}
 	return fmt.Sprintf("%s-tmpl-%x", taskName, h.Sum(nil)[:templateDigestBytes])
+}
+
+// issuedToken is a token handed out for a bound credential.
+type issuedToken struct {
+	cred *v1alpha1.Credential
+	tok  credentials.Token
+}
+
+// ensureCredentialedTemplate returns the task's ActorTemplate, creating it with
+// the bound credentials' tokens as environment when it does not exist yet.
+//
+// A template that exists already holds its tokens, so resuming a task does not
+// mint new ones. That bounds the tokens to one per template, at the price that
+// they are not renewed (see docs/credentials.md).
+func (r *TaskReconciler) ensureCredentialedTemplate(ctx context.Context, task *v1alpha1.Task, creds []*v1alpha1.Credential,
+	baseAtespace, baseTemplate, atespace, name string, extraEnv map[string]string) (*ateapipb.ActorTemplate, error) {
+	existing, err := r.client.GetActorTemplate(ctx, atespace, name)
+	switch {
+	case err == nil && existing != nil:
+		return existing, nil
+	case err != nil && status.Code(err) != codes.NotFound:
+		return nil, fmt.Errorf("looking up actor template %s/%s: %w", atespace, name, err)
+	}
+
+	issued, err := r.issueBound(ctx, task.Spec.GetCredentials(), creds)
+	if err != nil {
+		return nil, err
+	}
+
+	// The tokens are applied last so that they win over any other source of the
+	// same variable name.
+	env := make(map[string]string, len(extraEnv)+len(task.Spec.GetCredentials()))
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+	for _, b := range task.Spec.GetCredentials() {
+		env[b.GetEnv()] = issued[b.GetName()].tok.Value
+	}
+
+	tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, baseAtespace, baseTemplate, atespace, name, task.Spec.Image, env)
+	if err != nil {
+		// Nothing will ever hold these tokens, so do not leave them valid. The
+		// caller's context may be what failed, hence a fresh one.
+		r.revokeIssued(ctx, issued)
+		return nil, err
+	}
+	return tmpl, nil
+}
+
+// issueBound issues one token for each distinct credential the bindings name,
+// keyed by credential name. If any fails, those already issued are revoked.
+func (r *TaskReconciler) issueBound(ctx context.Context, bindings []*v1alpha1.CredentialBinding, creds []*v1alpha1.Credential) (map[string]issuedToken, error) {
+	byName := make(map[string]*v1alpha1.Credential, len(creds))
+	for _, c := range creds {
+		byName[c.GetMetadata().GetName()] = c
+	}
+	issued := make(map[string]issuedToken, len(bindings))
+	fail := func(err error) (map[string]issuedToken, error) {
+		r.revokeIssued(ctx, issued)
+		return nil, err
+	}
+	for _, b := range bindings {
+		if _, done := issued[b.GetName()]; done {
+			continue
+		}
+		cred, ok := byName[b.GetName()]
+		if !ok {
+			return fail(fmt.Errorf("credential %q not found", b.GetName()))
+		}
+		if r.Credentials == nil {
+			return fail(errors.New("credentials are not configured on this server"))
+		}
+		tok, err := r.Credentials.Issue(ctx, cred)
+		if err != nil {
+			return fail(fmt.Errorf("issuing a token for credential %q: %w", b.GetName(), err))
+		}
+		issued[b.GetName()] = issuedToken{cred: cred, tok: tok}
+	}
+	return issued, nil
+}
+
+// revokeIssued revokes tokens that ended up unused. It runs on a context that is
+// not canceled with the caller's but is bounded, and it only logs failures: the
+// error being reported is the one that made the tokens unused.
+func (r *TaskReconciler) revokeIssued(ctx context.Context, issued map[string]issuedToken) {
+	if len(issued) == 0 {
+		return
+	}
+	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialRevokeTimeout)
+	defer cancel()
+	for name, it := range issued {
+		if _, err := r.Credentials.Revoke(revokeCtx, it.cred, it.tok); err != nil {
+			slog.Warn("could not revoke an unused credential token", "credential", name, "error", err)
+		}
+	}
 }
 
 // taskTemplatePattern matches every ActorTemplate name taskTemplateName can produce

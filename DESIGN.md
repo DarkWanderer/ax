@@ -63,4 +63,14 @@ The control plane exposes the `ax.v1alpha1.AX` gRPC service. Health checks are p
 | `UpdateModel` | Create or update a model configuration. |
 | `DeleteModel` | Delete a model configuration. |
 
+**Credentials**
+
+| RPC | Description |
+|---|---|
+| `GetCredential` | Get a credential by atespace and name. |
+| `ListCredentials` | List credentials in an atespace. |
+| `UpdateCredential` | Create or update a credential. |
+| `DeleteCredential` | Delete a credential and its stored state. |
+| `TestCredential` | Obtain a token for a credential, return it masked together with its expiry, and revoke it where possible. See [credentials](docs/credentials.md). |
+
 Request and response types follow the `<Method>Request` / `<Method>Response` convention. Generated Go types live in [`pkg/apis/v1alpha1`](pkg/apis/v1alpha1).

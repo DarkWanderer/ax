@@ -33,6 +33,10 @@ spec:
       goal: "Install dependencies and run the test suite"   # Antigravity prepares the workspace to this goal on first run
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
+
+  credentials:   # tokens from Credential resources, injected as environment variables
+    - name: claude
+      env: CLAUDE_CODE_OAUTH_TOKEN
 ```
 
 ### Binding several workspaces
@@ -129,3 +133,26 @@ spec:
   parameters:
     maxTokens: 16000
 ```
+
+## Credential
+
+A `Credential` references Kubernetes Secrets and tells AX how to turn them into a token. It has exactly one of `githubApp`, `oauthAccessToken` or `oauthRefreshToken`.
+
+```bash
+kubectl create secret generic claude-oauth --from-literal=token="sk-ant-oat01-..."
+```
+
+```yaml
+apiVersion: ax.io/v1alpha1
+kind: Credential
+metadata:
+  name: claude
+  atespace: default
+spec:
+  oauthAccessToken:
+    tokenSecret:
+      name: claude-oauth
+      key: token
+```
+
+A task binds it with `spec.credentials` (see [Task](#task)). All three types, the binding rules, `ax test credential`, and the limitations are in [Credentials](credentials.md).

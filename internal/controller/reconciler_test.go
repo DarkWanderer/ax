@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,6 +51,14 @@ type mockControlServer struct {
 	resumeActorErr    error
 	crashedActor      string
 	revertedActors    []string
+
+	// credMu guards the fields below, which the credential tests read while the
+	// server goroutine may still be writing them.
+	credMu            sync.Mutex
+	createdTemplates  []*ateapipb.ActorTemplate
+	createTemplateErr error
+	// onCreateTemplate runs when CreateActorTemplate is called, before it answers.
+	onCreateTemplate func()
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -66,6 +75,18 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	m.credMu.Lock()
+	hook, failWith := m.onCreateTemplate, m.createTemplateErr
+	m.credMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if failWith != nil {
+		return nil, failWith
+	}
+	m.credMu.Lock()
+	m.createdTemplates = append(m.createdTemplates, req.GetActorTemplate())
+	m.credMu.Unlock()
 	if m.actorTemplates == nil {
 		m.actorTemplates = make(map[string]bool)
 	}
@@ -249,7 +270,7 @@ func TestTaskReconciler(t *testing.T) {
 		Status: &v1alpha1.TaskStatus{Actor: "not-the-task", Phase: "Running"},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
@@ -314,7 +335,7 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 		},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
@@ -374,7 +395,7 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 		},
 	}
 
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err == nil {
 		t.Fatal("expected Reconcile to return an error when SuspendActor fails")
 	}
@@ -447,7 +468,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	}
 
 	// Case 1: Worker not responding on readyz -> WorkspaceReady=False and Ready=False.
-	reconciled, err := reconciler.Reconcile(ctx, task, nil)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
@@ -456,7 +477,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 
 	// Case 2: Worker readyz endpoint succeeds -> WorkspaceReady=True and Ready=True.
 	mockSrv.workerIP = httpLis.Addr().String()
-	reconciledReady, err := reconciler.Reconcile(ctx, task, nil)
+	reconciledReady, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile with ready worker failed: %v", err)
 	}
@@ -467,7 +488,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	// already initialized so WorkspaceReady stays True.
 	task = reconciledReady
 	task.Status.Phase = "Suspended"
-	reconciledSuspended, err := reconciler.Reconcile(ctx, task, nil)
+	reconciledSuspended, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile with suspend failed: %v", err)
 	}
@@ -482,7 +503,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	mockSrv.workerIP = "127.0.0.1:1"
 	task = reconciledSuspended
 	task.Status.Phase = "Running"
-	reconciledResumed, err := reconciler.Reconcile(ctx, task, nil)
+	reconciledResumed, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err != nil {
 		t.Fatalf("Reconcile with resume failed: %v", err)
 	}
@@ -494,7 +515,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 
 	// A launch configuration change must still get a distinct template.
 	task.Spec.Command = []string{"python3", "agent.py"}
-	if _, err := reconciler.Reconcile(ctx, task, nil); err != nil {
+	if _, err := reconciler.Reconcile(ctx, task, nil, nil); err != nil {
 		t.Fatalf("Reconcile with changed command failed: %v", err)
 	}
 	if got := len(mockSrv.actorTemplates); got != 2 {
@@ -724,7 +745,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 		Metadata: &v1alpha1.ObjectMeta{Name: "transient-atespace"},
 		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
 	}
-	reconciled, err := reconciler.Reconcile(ctx, task)
+	reconciled, err := reconciler.Reconcile(ctx, task, nil, nil)
 	if err == nil {
 		t.Fatal("expected error from Reconcile when EnsureAtespace fails, got nil")
 	}
@@ -740,7 +761,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 		Metadata: &v1alpha1.ObjectMeta{Name: "transient-actor"},
 		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
 	}
-	reconciled2, err := reconciler.Reconcile(ctx, task2)
+	reconciled2, err := reconciler.Reconcile(ctx, task2, nil, nil)
 	if err == nil {
 		t.Fatal("expected error from Reconcile when EnsureActor fails, got nil")
 	}
@@ -758,7 +779,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
 		Status:   &v1alpha1.TaskStatus{Phase: "Running"},
 	}
-	reconciled3, err := reconciler.Reconcile(ctx, task3)
+	reconciled3, err := reconciler.Reconcile(ctx, task3, nil, nil)
 	if err == nil {
 		t.Fatal("expected error from Reconcile when ResumeActor fails, got nil")
 	}
@@ -770,7 +791,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	// Recovery on retry:
 	mockSrv.resumeActorErr = nil
 	reconciled3.Status.Phase = "Running"
-	recovered, err := reconciler.Reconcile(ctx, reconciled3)
+	recovered, err := reconciler.Reconcile(ctx, reconciled3, nil, nil)
 	if err != nil {
 		t.Fatalf("expected Reconcile to succeed after Substrate recovers, got %v", err)
 	}
@@ -784,7 +805,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 		Metadata: &v1alpha1.ObjectMeta{Name: "permanent-actor-err"},
 		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
 	}
-	reconciled4, err := reconciler.Reconcile(ctx, task4)
+	reconciled4, err := reconciler.Reconcile(ctx, task4, nil, nil)
 	if err == nil {
 		t.Fatal("expected error on InvalidArgument, got nil")
 	}

@@ -25,7 +25,9 @@ import (
 	"time"
 
 	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/credentials"
 	"github.com/google/ax/internal/lock"
+	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/server"
 	"github.com/google/ax/internal/store/redis"
 	"github.com/google/ax/internal/substrate"
@@ -90,6 +92,14 @@ func main() {
 	rStore := redis.NewStore(rClient, redis.Options{})
 	rLocker := lock.NewRedisLocker(rClient, lock.RedisLockerOptions{})
 
+	// One service backs both `ax test credential` and task provisioning, so they
+	// share the Redis state and lock that keep rotating refresh tokens consistent.
+	credService := &credentials.Service{
+		Secrets: model.GetKubernetesSecret,
+		State:   rStore,
+		Locker:  rLocker,
+	}
+
 	var reconciler server.Reconciler
 	subClient, err := substrate.NewClientWithOptions(substrate.ClientOptions{
 		Target:      substrateEndpoint,
@@ -103,12 +113,15 @@ func main() {
 		slog.Warn("could not initialize substrate client; running without substrate reconciliation", "error", err)
 	} else {
 		defer subClient.Close()
-		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+		taskReconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+		taskReconciler.Credentials = credService
+		reconciler = taskReconciler
 	}
 
 	srv := server.NewServer(rStore, server.Options{
-		Locker:     rLocker,
-		Reconciler: reconciler,
+		Locker:      rLocker,
+		Reconciler:  reconciler,
+		Credentials: credService,
 	})
 
 	httpServer := &http.Server{

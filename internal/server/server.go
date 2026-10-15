@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/ax/internal/credentials"
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/internal/substrate"
@@ -34,7 +35,7 @@ import (
 
 // Reconciler coordinates sandbox/actor lifecycles on Agent Substrate directly.
 type Reconciler interface {
-	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
+	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, creds []*v1alpha1.Credential) (*v1alpha1.Task, error)
 	ReconcileDelete(ctx context.Context, atespace, taskName string) error
 }
 
@@ -42,15 +43,19 @@ type Reconciler interface {
 type Options struct {
 	Locker     lock.Locker
 	Reconciler Reconciler
+	// Credentials issues tokens for `test credential`. Without it, TestCredential
+	// fails with FailedPrecondition.
+	Credentials *credentials.Service
 }
 
 // Server provides the gRPC API for AX.
 type Server struct {
 	v1alpha1.UnimplementedAXServer
-	store      store.Store
-	locker     lock.Locker
-	reconciler Reconciler
-	grpcServer *grpc.Server
+	store       store.Store
+	locker      lock.Locker
+	reconciler  Reconciler
+	credentials *credentials.Service
+	grpcServer  *grpc.Server
 }
 
 // NewServer creates a new AX API server.
@@ -65,10 +70,11 @@ func NewServer(s store.Store, opts ...Options) *Server {
 	}
 
 	srv := &Server{
-		store:      s,
-		locker:     locker,
-		reconciler: opt.Reconciler,
-		grpcServer: grpc.NewServer(),
+		store:       s,
+		locker:      locker,
+		reconciler:  opt.Reconciler,
+		credentials: opt.Credentials,
+		grpcServer:  grpc.NewServer(),
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
@@ -173,6 +179,13 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 		return nil, status.Errorf(codes.Internal, "checking existing task: %v", err)
 	}
 
+	// A binding to a credential that does not exist can never be satisfied, so
+	// refuse the task now instead of saving an immutable record that cannot start.
+	creds, err := s.requireCredentials(ctx, atespace, task)
+	if err != nil {
+		return nil, err
+	}
+
 	if task.Metadata.CreationTimestamp == nil {
 		task.Metadata.CreationTimestamp = timestamppb.Now()
 	}
@@ -187,7 +200,7 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	// Directly reconcile with Substrate
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces, creds)
 		if err != nil {
 			slog.Error("direct reconcile error on create task", "task", taskName, "error", err)
 			if reconciled != nil && reconciled.Status != nil {
@@ -300,7 +313,7 @@ func (s *Server) SuspendTask(ctx context.Context, req *v1alpha1.SuspendTaskReque
 
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces, s.fetchCredentials(ctx, atespace, task))
 		if err != nil {
 			if substrate.IsTransientError(err) {
 				return nil, status.Errorf(codes.Unavailable, "suspending task on substrate: %v", err)
@@ -351,7 +364,7 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 
 	if s.reconciler != nil {
 		workspaces := s.fetchWorkspaces(ctx, atespace, task)
-		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces...)
+		reconciled, err := s.reconciler.Reconcile(ctx, task, workspaces, s.fetchCredentials(ctx, atespace, task))
 		if err != nil {
 			if reconciled != nil && reconciled.Status != nil {
 				task.Status = reconciled.Status
@@ -394,6 +407,46 @@ func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1a
 		}
 	}
 	return workspaces
+}
+
+// fetchCredentials returns the credentials the task binds, each once, skipping
+// any that no longer exist: a task keeps working after its credential is deleted
+// for as long as its ActorTemplate still holds the token.
+func (s *Server) fetchCredentials(ctx context.Context, atespace string, task *v1alpha1.Task) []*v1alpha1.Credential {
+	var creds []*v1alpha1.Credential
+	seen := map[string]bool{}
+	for _, b := range task.GetSpec().GetCredentials() {
+		if b.GetName() == "" || seen[b.GetName()] {
+			continue
+		}
+		seen[b.GetName()] = true
+		if c, err := s.store.GetCredential(ctx, atespace, b.GetName()); err == nil {
+			creds = append(creds, c)
+		}
+	}
+	return creds
+}
+
+// requireCredentials is fetchCredentials for creation: every bound credential
+// must exist.
+func (s *Server) requireCredentials(ctx context.Context, atespace string, task *v1alpha1.Task) ([]*v1alpha1.Credential, error) {
+	var creds []*v1alpha1.Credential
+	seen := map[string]bool{}
+	for _, b := range task.GetSpec().GetCredentials() {
+		if seen[b.GetName()] {
+			continue
+		}
+		seen[b.GetName()] = true
+		c, err := s.store.GetCredential(ctx, atespace, b.GetName())
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, status.Errorf(codes.FailedPrecondition, "credential %q not found in atespace %q", b.GetName(), atespace)
+			}
+			return nil, status.Errorf(codes.Internal, "getting credential %q: %v", b.GetName(), err)
+		}
+		creds = append(creds, c)
+	}
+	return creds, nil
 }
 
 func (s *Server) WatchTask(req *v1alpha1.WatchTaskRequest, stream grpc.ServerStreamingServer[v1alpha1.WatchTaskResponse]) error {
