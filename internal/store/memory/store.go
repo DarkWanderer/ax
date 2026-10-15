@@ -44,6 +44,9 @@ type MemoryStore struct {
 	models     map[string]*v1alpha1.Model
 	workspaces map[string]*v1alpha1.Workspace
 	watchers   map[string][]chan *v1alpha1.Task
+
+	credentials      map[string]*v1alpha1.Credential
+	credentialStates map[string]store.CredentialState
 }
 
 // NewStore creates a new in-memory Store.
@@ -53,6 +56,9 @@ func NewStore() *MemoryStore {
 		models:     make(map[string]*v1alpha1.Model),
 		workspaces: make(map[string]*v1alpha1.Workspace),
 		watchers:   make(map[string][]chan *v1alpha1.Task),
+
+		credentials:      make(map[string]*v1alpha1.Credential),
+		credentialStates: make(map[string]store.CredentialState),
 	}
 }
 
@@ -211,6 +217,83 @@ func (s *MemoryStore) DeleteModel(ctx context.Context, atespace, name string) er
 	defer s.mu.Unlock()
 
 	delete(s.models, taskKey(atespace, name))
+	return nil
+}
+
+func (s *MemoryStore) SaveCredential(ctx context.Context, cred *v1alpha1.Credential) error {
+	if cred.Metadata == nil {
+		cred.Metadata = &v1alpha1.ObjectMeta{}
+	}
+	if cred.Metadata.Name == "" {
+		return errors.New("credential name is required")
+	}
+	if cred.Metadata.Atespace == "" {
+		cred.Metadata.Atespace = "default"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.credentials[taskKey(cred.Metadata.Atespace, cred.Metadata.Name)] = clone(cred)
+	return nil
+}
+
+func (s *MemoryStore) GetCredential(ctx context.Context, atespace, name string) (*v1alpha1.Credential, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	c, ok := s.credentials[taskKey(atespace, name)]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return clone(c), nil
+}
+
+func (s *MemoryStore) ListCredentials(ctx context.Context, atespace string) ([]*v1alpha1.Credential, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*v1alpha1.Credential
+	for _, c := range s.credentials {
+		if atespace == "" || atespace == "*" || c.Metadata.Atespace == atespace {
+			result = append(result, clone(c))
+		}
+	}
+	return result, nil
+}
+
+func (s *MemoryStore) DeleteCredential(ctx context.Context, atespace, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := taskKey(atespace, name)
+	delete(s.credentials, key)
+	delete(s.credentialStates, key)
+	return nil
+}
+
+func (s *MemoryStore) GetCredentialState(ctx context.Context, atespace, name string) (*store.CredentialState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	st, ok := s.credentialStates[taskKey(atespace, name)]
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	return &st, nil
+}
+
+func (s *MemoryStore) SaveCredentialState(ctx context.Context, atespace, name string, state store.CredentialState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.credentialStates[taskKey(atespace, name)] = state
+	return nil
+}
+
+func (s *MemoryStore) DeleteCredentialState(ctx context.Context, atespace, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.credentialStates, taskKey(atespace, name))
 	return nil
 }
 

@@ -26,6 +26,18 @@ var (
 	ErrNotFound = errors.New("resource not found")
 )
 
+// CredentialState is what the credential issuer must remember between calls.
+// It is stored apart from the Credential resource so that no API read can
+// return it.
+type CredentialState struct {
+	// RefreshToken is the most recent refresh token the identity provider
+	// rotated to. It supersedes the seed Secret while SeedDigest still matches.
+	RefreshToken string
+	// SeedDigest identifies the seed that RefreshToken descends from. When the
+	// seed changes, the digest no longer matches and the state is ignored.
+	SeedDigest string
+}
+
 // Store defines the storage interface for AX resources.
 type Store interface {
 	SaveTask(ctx context.Context, task *v1alpha1.Task) error
@@ -43,6 +55,16 @@ type Store interface {
 	GetModel(ctx context.Context, atespace, name string) (*v1alpha1.Model, error)
 	ListModels(ctx context.Context, atespace string) ([]*v1alpha1.Model, error)
 	DeleteModel(ctx context.Context, atespace, name string) error
+
+	SaveCredential(ctx context.Context, cred *v1alpha1.Credential) error
+	GetCredential(ctx context.Context, atespace, name string) (*v1alpha1.Credential, error)
+	ListCredentials(ctx context.Context, atespace string) ([]*v1alpha1.Credential, error)
+	// DeleteCredential also removes the credential's state.
+	DeleteCredential(ctx context.Context, atespace, name string) error
+	// GetCredentialState returns ErrNotFound when the credential has no state.
+	GetCredentialState(ctx context.Context, atespace, name string) (*CredentialState, error)
+	SaveCredentialState(ctx context.Context, atespace, name string, state CredentialState) error
+	DeleteCredentialState(ctx context.Context, atespace, name string) error
 
 	WatchTask(ctx context.Context, atespace, name string) (<-chan *v1alpha1.Task, io.Closer, error)
 	Close() error

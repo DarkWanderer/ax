@@ -36,3 +36,9 @@ A binding can also carry a `goal`, a plain-language description of the environme
 A configuration for a model provider and its parameters: which provider to call, the model identifier, provider-specific generation parameters such as max_tokens, and references to the Kubernetes secret holding the credentials.
 
 Declaring models as cluster resources makes them manageable and reusable across tasks. The configuration lives in one place instead of in every agent's environment, so rotating a key, pinning a new model version, or tuning parameters is a single `ax apply` rather than a hunt through task definitions. AX's own components read `Model` resources as well, for example when planning a workspace from a goal.
+
+## Credential
+
+A reference to the secrets behind a token, and the rule for turning them into one. A `Credential` is a GitHub App installation, a long-lived OAuth access token such as the one `claude setup-token` prints, or an OAuth refresh token that AX exchanges for access tokens. A task binds credentials in `spec.credentials` and receives each token as an environment variable.
+
+The secret material stays in Kubernetes Secrets and in AX's own state; the task spec and the `Credential` resource only name them. `ax test credential` checks that a credential works without ever showing the token. See [Credentials](credentials.md) for the types and what to expect from token lifetimes.

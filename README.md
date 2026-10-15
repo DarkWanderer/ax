@@ -44,13 +44,14 @@ ax ssh test -- ls -al /workspace
 
 ## Why?
 
-Agents are a new kind of workload. They are neither stateless microservices nor run-to-completion batch jobs. They accumulate state, need strict isolation, call out to model APIs and tool servers, and can burn money in a loop if nobody is watching. AX gives you three small primitives that handle all of that declaratively:
+Agents are a new kind of workload. They are neither stateless microservices nor run-to-completion batch jobs. They accumulate state, need strict isolation, call out to model APIs and tool servers, and can burn money in a loop if nobody is watching. AX gives you a few small primitives that handle all of that declaratively:
 
 | You want to... | AX gives you |
 |---|---|
 | Run untrusted agent code in an isolated sandbox with CPU/memory limits | **`Task`** |
 | Pre-wire Git repos, MCP servers, and skill packages so every agent starts warm | **`Workspace`** |
 | Configure which LLM the platform itself uses, with credentials from a Kubernetes secret | **`Model`** |
+| Give a task a GitHub token or a Claude OAuth token without putting it in the task spec | **`Credential`** ([guide](docs/credentials.md)) |
 | Pause an idle agent and pick up exactly where it left off | `ax suspend` / `ax resume` |
 | Shell into a running agent to see what it is doing | `ax ssh` |
 
@@ -110,8 +111,9 @@ Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It appli
 
 | Guide | Read it to... |
 |---|---|
-| [Concepts](docs/concepts.md) | Learn what a `Task`, `Workspace`, and `Model` each do, and how a task moves through phases and conditions. |
+| [Concepts](docs/concepts.md) | Learn what a `Task`, `Workspace`, `Model`, and `Credential` each do, and how a task moves through phases and conditions. |
 | [Manifests](docs/manifests.md) | Write your own YAML, with an annotated example of every kind. |
+| [Credentials](docs/credentials.md) | Hand tokens to tasks: GitHub Apps, OAuth access tokens, and refresh-token grants, plus `ax test credential`. |
 | [Sandbox](docs/sandbox.md) | See what the runner does on boot and what your command can rely on: metadata server, guest services, environment. |
 | [Runners](docs/runner.md) | Understand the contract between the control plane and the task container, and build your own runner image to replace the default. |
 | [Networking](docs/networking.md) | Reach a running task through the atenet router from the cluster, your laptop, or a gRPC client. |
@@ -157,6 +159,10 @@ ax get models
 # default-model   default    google     gemini-3.8-flash
 ax describe model default-model
 ax delete model default-model
+
+# Credentials: inspect, and check that the server can obtain a token (shown masked)
+ax get credentials
+ax test credential gh
 
 # Connection plumbing
 ax ctx                                # active kube context and how ax is reaching the control plane

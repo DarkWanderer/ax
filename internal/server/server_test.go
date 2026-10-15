@@ -317,10 +317,13 @@ type fakeReconciler struct {
 	deleteCount         int
 	deleteErr           error
 	onDelete            func(ctx context.Context, atespace, taskName string) error
+	// lastCredentials records the credentials of the most recent Reconcile call.
+	lastCredentials     []*v1alpha1.Credential
 }
 
-func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+func (f *fakeReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces []*v1alpha1.Workspace, creds []*v1alpha1.Credential) (*v1alpha1.Task, error) {
 	f.reconcileCount++
+	f.lastCredentials = creds
 	f.observedTask = proto.Clone(task).(*v1alpha1.Task)
 	if f.reconcileErr != nil {
 		if task.Status == nil {

@@ -119,6 +119,8 @@ func main() {
 		err = runResume(serverURL, atespace, cleanArgs)
 	case "delete":
 		err = runDelete(serverURL, atespace, cleanArgs)
+	case "test":
+		err = runTest(serverURL, atespace, cleanArgs)
 	case "ssh":
 		err = runSSH(serverURL, atespace, kubeContext, cleanArgs)
 	default:
@@ -198,13 +200,15 @@ Usage:
   ax [command] [flags]
 
 Available Commands:
-  apply -f <file>         Apply resources (tasks, workspaces, models) from a file or stdin
+  apply -f <file>         Apply resources (tasks, workspaces, models, credentials) from a file or stdin
   get tasks               List tasks
   get task <name>         Get a specific task
   get workspaces          List workspaces
   get workspace <name>    Get a specific workspace
   get models              List models
   get model <name>        Get a specific model
+  get credentials         List credentials
+  get credential <name>   Get a specific credential
   describe task <name>    Show detailed information about a task
   describe workspace <name> Show detailed information about a workspace
   describe model <name>   Show detailed information about a model
@@ -215,6 +219,8 @@ Available Commands:
   delete task <name>      Delete a task
   delete workspace <name> Delete a workspace
   delete model <name>     Delete a model
+  delete credential <name> Delete a credential
+  test credential <name>  Obtain a token for a credential on the server and show it masked
   ctx, context            Show active Kubernetes context and AX connection
   tunnel <list|stop>      Manage background tunnels to Kubernetes clusters
   version                 Print AX version
@@ -333,10 +339,23 @@ func applyDocument(ctx context.Context, client v1alpha1.AXClient, doc *yaml.Node
 		res, err := client.UpdateModel(ctx, &v1alpha1.UpdateModelRequest{Model: &m})
 		return head.Kind, res.GetMetadata().GetName(), outcome, err
 
+	case v1alpha1.KindCredential:
+		var c v1alpha1.Credential
+		if err := doc.Decode(&c); err != nil {
+			return "", "", "", err
+		}
+		existing, err := client.GetCredential(ctx, &v1alpha1.GetCredentialRequest{Atespace: c.GetMetadata().GetAtespace(), Name: c.GetMetadata().GetName()})
+		outcome, err := applyOutcome(err, existing.GetSpec(), c.GetSpec())
+		if err != nil {
+			return "", "", "", err
+		}
+		res, err := client.UpdateCredential(ctx, &v1alpha1.UpdateCredentialRequest{Credential: &c})
+		return head.Kind, res.GetMetadata().GetName(), outcome, err
+
 	case "":
 		return "", "", "", errors.New("missing kind")
 	default:
-		return "", "", "", fmt.Errorf("unsupported kind %q (expected Task, Workspace, or Model)", head.Kind)
+		return "", "", "", fmt.Errorf("unsupported kind %q (expected Task, Workspace, Model, or Credential)", head.Kind)
 	}
 }
 
@@ -519,6 +538,34 @@ func runGet(serverURL, atespace string, args []string) error {
 		}
 
 		return yaml.NewEncoder(os.Stdout).Encode(m)
+	}
+
+	if (resource == "credentials" || resource == "credential") && len(args) == 1 {
+		resp, err := client.ListCredentials(ctx, &v1alpha1.ListCredentialsRequest{Atespace: atespace})
+		if err != nil {
+			return fmt.Errorf("listing credentials: %w", err)
+		}
+
+		w := tabwriter.NewWriter(os.Stdout, 0, 8, 3, ' ', 0)
+		fmt.Fprintln(w, "NAME\tATESPACE\tTYPE")
+		for _, c := range resp.Credentials {
+			fmt.Fprintf(w, "%s\t%s\t%s\n",
+				c.GetMetadata().GetName(),
+				c.GetMetadata().GetAtespace(),
+				v1alpha1.CredentialType(c.GetSpec()),
+			)
+		}
+		return w.Flush()
+	}
+
+	if (resource == "credential" || resource == "credentials") && len(args) >= 2 {
+		name := args[1]
+		c, err := client.GetCredential(ctx, &v1alpha1.GetCredentialRequest{Atespace: atespace, Name: name})
+		if err != nil {
+			return fmt.Errorf("getting credential %q: %w", name, err)
+		}
+
+		return yaml.NewEncoder(os.Stdout).Encode(c)
 	}
 
 	return fmt.Errorf("unknown resource %q", resource)
@@ -756,7 +803,7 @@ func runWatch(serverURL, atespace string, args []string) error {
 // runDelete removes one resource by kind and name.
 func runDelete(serverURL, atespace string, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: ax delete <task|workspace|model> <name>")
+		return fmt.Errorf("usage: ax delete <task|workspace|model|credential> <name>")
 	}
 	kind, err := normalizeKind(args[0])
 	if err != nil {
@@ -791,6 +838,8 @@ func deleteResource(ctx context.Context, client v1alpha1.AXClient, kind, atespac
 		_, err = client.DeleteWorkspace(ctx, &v1alpha1.DeleteWorkspaceRequest{Atespace: atespace, Name: name})
 	case v1alpha1.KindModel:
 		_, err = client.DeleteModel(ctx, &v1alpha1.DeleteModelRequest{Atespace: atespace, Name: name})
+	case v1alpha1.KindCredential:
+		_, err = client.DeleteCredential(ctx, &v1alpha1.DeleteCredentialRequest{Atespace: atespace, Name: name})
 	default:
 		return fmt.Errorf("unsupported kind %q", kind)
 	}
@@ -812,11 +861,72 @@ func normalizeKind(kind string) (string, error) {
 		return v1alpha1.KindWorkspace, nil
 	case "model":
 		return v1alpha1.KindModel, nil
+	case "credential":
+		return v1alpha1.KindCredential, nil
 	case "":
 		return "", errors.New("missing kind")
 	default:
-		return "", fmt.Errorf("unsupported kind %q (expected task, workspace, or model)", kind)
+		return "", fmt.Errorf("unsupported kind %q (expected task, workspace, model, or credential)", kind)
 	}
+}
+
+// runTest has the server obtain a token for a credential, the way a task would,
+// and prints it masked. The raw token never leaves the server.
+func runTest(serverURL, atespace string, args []string) error {
+	const usage = "usage: ax test credential <name>"
+	if len(args) < 2 {
+		return errors.New(usage)
+	}
+	kind, err := normalizeKind(args[0])
+	if err != nil {
+		return err
+	}
+	if kind != v1alpha1.KindCredential {
+		return fmt.Errorf("only credentials can be tested (%s)", usage)
+	}
+	name := args[1]
+
+	client, conn, err := getAXClient(serverURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// The server allows itself 30s to issue the token and 10s to revoke it.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	resp, err := client.TestCredential(ctx, &v1alpha1.TestCredentialRequest{Atespace: atespace, Name: name})
+	if err != nil {
+		return fmt.Errorf("testing credential %q: %w", name, err)
+	}
+	fmt.Print(formatTestResult(name, resp, time.Now()))
+	return nil
+}
+
+// formatTestResult renders the outcome of `ax test credential`. now anchors the
+// relative expiry.
+func formatTestResult(name string, resp *v1alpha1.TestCredentialResponse, now time.Time) string {
+	expires := "unknown"
+	if resp.GetExpireTime() != nil {
+		t := resp.GetExpireTime().AsTime()
+		rel := "in " + formatAge(t.Sub(now))
+		if !t.After(now) {
+			rel = formatAge(now.Sub(t)) + " ago"
+		}
+		expires = fmt.Sprintf("%s (%s)", t.UTC().Format(time.RFC3339), rel)
+	}
+	revoked := "no"
+	if resp.GetRevoked() {
+		revoked = "yes"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "credential.ax.io/%s ok\n", name)
+	fmt.Fprintf(&b, "  type:    %s\n", resp.GetType())
+	fmt.Fprintf(&b, "  token:   %s\n", resp.GetMaskedToken())
+	fmt.Fprintf(&b, "  expires: %s\n", expires)
+	fmt.Fprintf(&b, "  revoked: %s\n", revoked)
+	return b.String()
 }
 
 // manifestFromArgs returns the manifest named by -f/--file (or stdin for "-").

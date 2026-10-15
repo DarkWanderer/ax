@@ -48,6 +48,15 @@ service AX {
   rpc UpdateModel(UpdateModelRequest) returns (Model);
   rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
 
+  // Credentials
+  rpc GetCredential(GetCredentialRequest) returns (Credential);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc UpdateCredential(UpdateCredentialRequest) returns (Credential);
+  rpc DeleteCredential(DeleteCredentialRequest) returns (DeleteCredentialResponse);
+  // TestCredential obtains a token for the credential on the server, reports it
+  // masked, and revokes it again where the issuer supports that. The raw token is
+  // never returned.
+  rpc TestCredential(TestCredentialRequest) returns (TestCredentialResponse);
 }
 
 // ObjectMeta is metadata for AX resources.
@@ -78,6 +87,16 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 6;
+  // credentials binds Credentials to the task. Each token is injected into the
+  // task's container as an environment variable.
+  repeated CredentialBinding credentials = 7;
+}
+
+message CredentialBinding {
+  // name is the Credential in the task's atespace.
+  string name = 1;
+  // env is the environment variable that receives the token.
+  string env = 2;
 }
 
 message EnvVar {
@@ -217,6 +236,53 @@ message SecretKeyRef {
   string key = 2;
 }
 
+// --- Credential ---
+
+message Credential {
+  string api_version = 1;
+  string kind = 2;
+  ObjectMeta metadata = 3;
+  CredentialSpec spec = 4;
+}
+
+// CredentialSpec holds exactly one credential type.
+message CredentialSpec {
+  oneof type {
+    GitHubAppCredential github_app = 1;
+    OAuthAccessTokenCredential oauth_access_token = 2;
+    OAuthRefreshTokenCredential oauth_refresh_token = 3;
+  }
+}
+
+// GitHubAppCredential mints a GitHub App installation token.
+message GitHubAppCredential {
+  int64 app_id = 1;
+  int64 installation_id = 2;
+  SecretKeyRef private_key_secret = 3;
+  repeated string repositories = 4;
+  map<string, string> permissions = 5;
+}
+
+// OAuthAccessTokenCredential is a long-lived OAuth access token that is used
+// as-is, for example the token printed by `claude setup-token`.
+message OAuthAccessTokenCredential {
+  SecretKeyRef token_secret = 1;
+}
+
+// OAuthRefreshTokenCredential exchanges a refresh token for access tokens with
+// the OAuth refresh_token grant. Rotated refresh tokens are kept by AX; the
+// referenced Secret is only the seed.
+message OAuthRefreshTokenCredential {
+  string token_url = 1;
+  string client_id = 2;
+  SecretKeyRef client_secret = 3;
+  repeated string scopes = 4;
+  SecretKeyRef refresh_token_secret = 5;
+  // revocation_url is the RFC 7009 token revocation endpoint. Without it,
+  // issued access tokens are not revoked.
+  string revocation_url = 6;
+}
+
 // --- RPC Request & Response Messages ---
 
 // Tasks
@@ -316,3 +382,43 @@ message DeleteModelRequest {
 
 message DeleteModelResponse {}
 
+// Credentials
+message GetCredentialRequest {
+  string atespace = 1;
+  string name = 2;
+}
+
+message ListCredentialsRequest {
+  string atespace = 1;
+}
+
+message ListCredentialsResponse {
+  repeated Credential credentials = 1;
+}
+
+message UpdateCredentialRequest {
+  Credential credential = 1;
+}
+
+message DeleteCredentialRequest {
+  string atespace = 1;
+  string name = 2;
+}
+
+message DeleteCredentialResponse {}
+
+message TestCredentialRequest {
+  string atespace = 1;
+  string name = 2;
+}
+
+message TestCredentialResponse {
+  // type is the credential type that was exercised, for example "githubApp".
+  string type = 1;
+  // masked_token shows only the ends of the token.
+  string masked_token = 2;
+  // expire_time is unset when the token has no known expiry.
+  google.protobuf.Timestamp expire_time = 3;
+  // revoked reports whether the token was revoked after being issued.
+  bool revoked = 4;
+}

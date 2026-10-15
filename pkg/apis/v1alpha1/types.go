@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,10 +31,11 @@ import (
 )
 
 const (
-	APIVersion    = "ax.io/v1alpha1"
-	KindTask      = "Task"
-	KindWorkspace = "Workspace"
-	KindModel     = "Model"
+	APIVersion     = "ax.io/v1alpha1"
+	KindTask       = "Task"
+	KindWorkspace  = "Workspace"
+	KindModel      = "Model"
+	KindCredential = "Credential"
 
 	DefaultTaskImage       = "gcr.io/ax-substrate/ate-images/ax-task-runner"
 	DefaultSystemNamespace = "ax-system"
@@ -203,6 +205,11 @@ func (w *Workspace) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, 
 func (m *Model) MarshalYAML() (any, error)        { return marshalYAML(m) }
 func (m *Model) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, m, normalizeModel) }
 
+// A spec that sets two credential types is rejected by protojson itself, because
+// the types are members of a proto oneof.
+func (c *Credential) MarshalYAML() (any, error)        { return marshalYAML(c) }
+func (c *Credential) UnmarshalYAML(n *yaml.Node) error { return unmarshalYAML(n, c, nil) }
+
 // Workspace bindings.
 //
 // A task binds one or more workspaces through spec.workspaces. Every entry is
@@ -256,6 +263,44 @@ const MaxNameLength = 63
 
 var nameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
+// MaxSecretKeyLength is the longest data key a Kubernetes Secret may have.
+const MaxSecretKeyLength = 253
+
+// MaxSecretNameLength is the longest name a Kubernetes Secret may have. Unlike
+// MaxNameLength's RFC 1123 label, used for AX's own resource names, a Secret
+// name is a full RFC 1123 DNS subdomain: '.'-separated labels and a longer
+// overall length.
+const MaxSecretNameLength = 253
+
+// secretNameRegexp matches a valid Kubernetes Secret name: one or more
+// '.'-separated labels, each a lowercase alphanumeric run optionally containing '-'.
+var secretNameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
+// secretKeyRegexp matches a valid Kubernetes Secret data key: the charset the
+// API server itself enforces for ConfigMap and Secret keys.
+var secretKeyRegexp = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
+
+// validateSecretKeyRef rejects references that can never identify real Secret
+// data: a name that breaks Kubernetes naming rules, or a key with characters the
+// API server refuses (notably the JSONPath metacharacters "[", "]" and "'", which
+// GetKubernetesSecret's kubectl fallback embeds into a jsonpath expression). A
+// credential that cannot resolve should fail when applied, not when a task first
+// needs its token.
+func validateSecretKeyRef(field string, ref *SecretKeyRef) error {
+	if ref == nil {
+		return fmt.Errorf("%s: a secret reference is required", field)
+	}
+	name := ref.GetName()
+	if name == "" || len(name) > MaxSecretNameLength || !secretNameRegexp.MatchString(name) {
+		return fmt.Errorf("%s.name: invalid value %q: must be a lowercase RFC 1123 DNS subdomain of at most %d characters", field, name, MaxSecretNameLength)
+	}
+	key := ref.GetKey()
+	if key == "" || len(key) > MaxSecretKeyLength || !secretKeyRegexp.MatchString(key) {
+		return fmt.Errorf("%s.key: invalid value %q: must be 1-%d characters, each alphanumeric, '-', '_', or '.'", field, key, MaxSecretKeyLength)
+	}
+	return nil
+}
+
 // ValidateName reports whether s can be used as a resource name or atespace: a
 // lowercase RFC 1123 label of at most MaxNameLength characters.
 func ValidateName(s string) error {
@@ -305,6 +350,177 @@ func ValidateModel(m *Model) error {
 	return ValidateObjectMeta(m.GetMetadata())
 }
 
+// Credentials.
+
+// CredentialType returns the name of the credential type a spec sets, using the
+// manifest field name (githubApp, oauthAccessToken or oauthRefreshToken), or ""
+// when none is set.
+func CredentialType(spec *CredentialSpec) string {
+	switch spec.GetType().(type) {
+	case *CredentialSpec_GithubApp:
+		return "githubApp"
+	case *CredentialSpec_OauthAccessToken:
+		return "oauthAccessToken"
+	case *CredentialSpec_OauthRefreshToken:
+		return "oauthRefreshToken"
+	}
+	return ""
+}
+
+// ValidateCredential reports the first problem with a credential that would
+// make it unusable. It is called by the API server before saving.
+func ValidateCredential(c *Credential) error {
+	if err := ValidateObjectMeta(c.GetMetadata()); err != nil {
+		return err
+	}
+	switch t := c.GetSpec().GetType().(type) {
+	case *CredentialSpec_GithubApp:
+		return validateGitHubApp(t.GithubApp)
+	case *CredentialSpec_OauthAccessToken:
+		return validateSecretKeyRef("spec.oauthAccessToken.tokenSecret", t.OauthAccessToken.GetTokenSecret())
+	case *CredentialSpec_OauthRefreshToken:
+		return validateOAuthRefreshToken(t.OauthRefreshToken)
+	}
+	return errors.New("spec: exactly one credential type (githubApp, oauthAccessToken or oauthRefreshToken) is required")
+}
+
+// maxGitHubRepositories is how many repositories one installation token request
+// may be scoped to.
+const maxGitHubRepositories = 500
+
+func validateGitHubApp(app *GitHubAppCredential) error {
+	if app.GetAppId() <= 0 {
+		return errors.New("spec.githubApp.appId: must be positive")
+	}
+	if app.GetInstallationId() <= 0 {
+		return errors.New("spec.githubApp.installationId: must be positive")
+	}
+	if err := validateSecretKeyRef("spec.githubApp.privateKeySecret", app.GetPrivateKeySecret()); err != nil {
+		return err
+	}
+	if n := len(app.GetRepositories()); n == 0 || n > maxGitHubRepositories {
+		return fmt.Errorf("spec.githubApp.repositories: must contain 1 to %d names", maxGitHubRepositories)
+	}
+	seen := make(map[string]bool, len(app.GetRepositories()))
+	for _, name := range app.GetRepositories() {
+		folded := strings.ToLower(name)
+		if name == "" || strings.ContainsAny(name, "/ \\@") || seen[folded] {
+			return fmt.Errorf("spec.githubApp.repositories: invalid or duplicate name %q", name)
+		}
+		seen[folded] = true
+	}
+	if len(app.GetPermissions()) == 0 {
+		return errors.New("spec.githubApp.permissions: at least one permission is required")
+	}
+	for name, level := range app.GetPermissions() {
+		if !githubAppRepositoryPermissions[name] {
+			return fmt.Errorf("spec.githubApp.permissions: unknown permission %q", name)
+		}
+		if level != "read" && level != "write" {
+			return fmt.Errorf("spec.githubApp.permissions: invalid permission %q=%q (must be \"read\" or \"write\")", name, level)
+		}
+	}
+	return nil
+}
+
+// githubAppRepositoryPermissions lists the repository-level permission keys
+// GitHub's installation-token endpoint accepts. GitHub rejects an unknown key
+// only when the token is requested, so without this check a typo would surface
+// when a task first needs the token instead of when the credential is applied.
+var githubAppRepositoryPermissions = map[string]bool{
+	"actions":                      true,
+	"administration":               true,
+	"checks":                       true,
+	"contents":                     true,
+	"deployments":                  true,
+	"environments":                 true,
+	"issues":                       true,
+	"metadata":                     true,
+	"packages":                     true,
+	"pages":                        true,
+	"pull_requests":                true,
+	"repository_custom_properties": true,
+	"repository_hooks":             true,
+	"repository_projects":          true,
+	"secret_scanning_alerts":       true,
+	"secrets":                      true,
+	"security_events":              true,
+	"single_file":                  true,
+	"statuses":                     true,
+	"vulnerability_alerts":         true,
+	"workflows":                    true,
+}
+
+func validateOAuthRefreshToken(o *OAuthRefreshTokenCredential) error {
+	if err := validateHTTPSURL("spec.oauthRefreshToken.tokenUrl", o.GetTokenUrl()); err != nil {
+		return err
+	}
+	if o.GetClientId() == "" {
+		return errors.New("spec.oauthRefreshToken.clientId: is required")
+	}
+	// A client secret is optional: public clients authenticate with the client id alone.
+	if o.GetClientSecret() != nil {
+		if err := validateSecretKeyRef("spec.oauthRefreshToken.clientSecret", o.GetClientSecret()); err != nil {
+			return err
+		}
+	}
+	if err := validateSecretKeyRef("spec.oauthRefreshToken.refreshTokenSecret", o.GetRefreshTokenSecret()); err != nil {
+		return err
+	}
+	if o.GetRevocationUrl() != "" {
+		return validateHTTPSURL("spec.oauthRefreshToken.revocationUrl", o.GetRevocationUrl())
+	}
+	return nil
+}
+
+// validateHTTPSURL requires an https URL with a host, because the credential
+// endpoints receive client and refresh secrets.
+func validateHTTPSURL(field, raw string) error {
+	u, err := url.Parse(raw)
+	if raw == "" || err != nil || u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("%s: invalid value %q: must be an https URL", field, raw)
+	}
+	return nil
+}
+
+// envNameRegexp matches the names a container environment variable can portably have.
+var envNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedEnvPrefix is claimed by the variables AX sets itself, such as AX_TASK_YAML.
+const reservedEnvPrefix = "AX_"
+
+// validateCredentialBindings checks spec.credentials. A binding's variable must
+// not also be set by spec.env: the runner re-applies spec.env from AX_TASK_YAML
+// on top of the container environment, which would overwrite the token.
+func validateCredentialBindings(spec *TaskSpec) error {
+	specEnv := make(map[string]bool, len(spec.GetEnv()))
+	for _, e := range spec.GetEnv() {
+		specEnv[e.GetName()] = true
+	}
+	usedBy := make(map[string]string, len(spec.GetCredentials()))
+	for i, b := range spec.GetCredentials() {
+		field := fmt.Sprintf("spec.credentials[%d]", i)
+		if err := ValidateName(b.GetName()); err != nil {
+			return fmt.Errorf("%s.name: invalid value %q: %w", field, b.GetName(), err)
+		}
+		env := b.GetEnv()
+		if !envNameRegexp.MatchString(env) {
+			return fmt.Errorf("%s.env: invalid value %q: must match %s", field, env, envNameRegexp)
+		}
+		if strings.HasPrefix(env, reservedEnvPrefix) {
+			return fmt.Errorf("%s.env: invalid value %q: must not start with %q", field, env, reservedEnvPrefix)
+		}
+		if other, dup := usedBy[env]; dup {
+			return fmt.Errorf("%s.env: env %q is already used by credential %q", field, env, other)
+		}
+		usedBy[env] = b.GetName()
+		if specEnv[env] {
+			return fmt.Errorf("%s.env: env %q collides with spec.env", field, env)
+		}
+	}
+	return nil
+}
+
 // ValidateTask reports the first problem with a task that would make it
 // impossible to run correctly. It is called by the API server before saving.
 func ValidateTask(t *Task) error {
@@ -314,6 +530,9 @@ func ValidateTask(t *Task) error {
 	spec := t.GetSpec()
 	if spec == nil {
 		return nil
+	}
+	if err := validateCredentialBindings(spec); err != nil {
+		return err
 	}
 	refs := spec.WorkspaceRefs()
 	paths := spec.WorkspacePaths()
